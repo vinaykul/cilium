@@ -511,6 +511,10 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *datapath.LocalNodeC
 
 	if option.Config.EnableHostFirewall {
 		cDefinesMap["ENABLE_HOST_FIREWALL"] = "1"
+		//TODO: Move to its own config
+		cDefinesMap["ENABLE_HOST_PROCESS_NETID"] = "1"
+		cDefinesMap["HOST_PROCESS_NETID_MAP"] = "host_process_netid_map"
+		cDefinesMap["HOST_PROCESS_NETID_MAP_SIZE"] = "16384"
 	}
 
 	if option.Config.EnableIPSec {

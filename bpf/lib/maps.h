@@ -303,4 +303,15 @@ static __always_inline void ep_tail_call(struct __ctx_buff *ctx __maybe_unused,
 	tail_call_static(ctx, &CALLS_MAP, index);
 }
 #endif /* SKIP_CALLS_MAP */
+
+#ifdef ENABLE_HOST_PROCESS_NETID
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct host_process_netid_key);
+	__type(value, struct host_process_netid_value);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__uint(max_entries, HOST_PROCESS_NETID_MAP_SIZE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} HOST_PROCESS_NETID_MAP __section_maps_btf;
+#endif /* ENABLE_HOST_PROCESS_NETID */
 #endif

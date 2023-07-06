@@ -996,7 +996,6 @@ __section("from-netdev")
 int cil_from_netdev(struct __ctx_buff *ctx)
 {
 	__u32 __maybe_unused vlan_id;
-
 #ifdef ENABLE_NODEPORT_ACCELERATION
 #ifdef HAVE_ENCAP
 	__u32 flags = ctx_get_xfer(ctx, XFER_FLAGS);
@@ -1049,6 +1048,11 @@ int cil_from_host(struct __ctx_buff *ctx)
 	return handle_netdev(ctx, true);
 }
 
+#ifdef ENABLE_HOST_PROCESS_NETID
+static __always_inline int
+handle_host_process_netid_ipv4(struct __ctx_buff *ctx, __u16 proto, __maybe_unused struct trace_ctx *trace, __maybe_unused __s8 *ext_err);
+#endif /* ENABLE_HOST_PROCESS_NETID */
+
 /*
  * to-netdev is attached as a tc egress filter to one or more physical devices
  * managed by Cilium (e.g., eth0). This program is only attached when:
@@ -1068,7 +1072,6 @@ int cil_to_netdev(struct __ctx_buff *ctx __maybe_unused)
 #ifdef ENABLE_HOST_FIREWALL
 	__s8 ext_err = 0;
 #endif
-
 	/* Filter allowed vlan id's and pass them back to kernel.
 	 */
 	if (ctx->vlan_present) {
@@ -1168,6 +1171,36 @@ out:
 		return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP,
 					      METRIC_EGRESS);
 #endif
+
+#ifdef ENABLE_HOST_PROCESS_NETID
+	if (!proto && !validate_ethertype(ctx, &proto)) {
+		ret = DROP_UNSUPPORTED_L2;
+		goto skip;
+	}
+	switch (proto) {
+# if defined ENABLE_ARP_PASSTHROUGH || defined ENABLE_ARP_RESPONDER
+	case bpf_htons(ETH_P_ARP):
+		ret = CTX_ACT_OK;
+		break;
+# endif
+# ifdef ENABLE_IPV6
+	case bpf_htons(ETH_P_IPV6):
+		//TODO: IMPLEMENT
+		break;
+# endif
+# ifdef ENABLE_IPV4
+	case bpf_htons(ETH_P_IP): {
+		ret = handle_host_process_netid_ipv4(ctx, proto, &trace, &ext_err);
+		break;
+	}
+# endif
+	default:
+		ret = DROP_UNKNOWN_L3;
+		break;
+	}
+skip:
+#endif /* ENABLE_HOST_PROCESS_NETID */
+
 	send_trace_notify(ctx, TRACE_TO_NETWORK, 0, 0, 0,
 			  0, trace.reason, trace.monitor);
 
@@ -1427,5 +1460,79 @@ int handle_lxc_traffic(struct __ctx_buff *ctx)
 	return to_host_from_lxc(ctx);
 }
 #endif /* ENABLE_HOST_FIREWALL */
+
+#ifdef ENABLE_HOST_PROCESS_NETID
+static __always_inline int
+handle_host_process_netid_ipv4(struct __ctx_buff *ctx, __maybe_unused __u16 proto,
+		__maybe_unused struct trace_ctx *trace, __maybe_unused __s8 *ext_err)
+{
+	void *data, *data_end;
+	struct iphdr *ip4;
+	struct remote_endpoint_info *info;
+	__u32 identity = ctx_load_meta(ctx, CB_SRC_LABEL);
+	__u32 mark_identity = get_identity(ctx);
+	__u64 cgroup_id = skb_cgroup_id(ctx);
+	int ret = TC_ACT_OK;
+
+	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+		return DROP_INVALID;
+
+	if (identity == 0) {
+		/* Lookup BPF map for host process or hostNetwork pod process cgroup-id <> network-id entry
+		 * If found, use it as network identity and encapsulate.
+		 * If not found, we can take actions based on policy. Choices we have:
+		 *   a) default allow without encap
+		 *   b) encap with WORLD_ID or UNMAMAGED_ID or something appropriate
+		 *   c) default drop
+		 *
+		 *   Also, how do we handle if CT tells us this is response from app without BPF map entry?
+		 *   TODO: This needs design discussion
+		 */
+		struct host_process_netid_key netidkey;
+		struct host_process_netid_value *netidvalue;
+		netidkey.cgroup_id = cgroup_id;
+		netidvalue = map_lookup_elem(&HOST_PROCESS_NETID_MAP, &netidkey);
+		if (!netidvalue) {
+			bool is_reply = false;
+			struct ipv4_ct_tuple tuple = {
+				.daddr = ip4->daddr,
+				.saddr = ip4->saddr,
+				.nexthdr = ip4->protocol
+			};
+			ct_is_reply4(get_ct_map4(&tuple), ctx, ETH_HLEN +
+			     ipv4_hdrlen(ip4), &tuple, &is_reply);
+#if 1
+		// Hacky simulation of deny network policy for host process ICMP unless allowed by config
+		if ((ip4->protocol == IPPROTO_ICMP) && !is_reply) {
+			printk("DBG: ==> HANDLE_HOST_PROC_ID: DROPPING ICMP PACKET FROM CGROUPID=%llu DUE TO NO POLICY\n", cgroup_id);
+			return TC_ACT_SHOT;
+		}
+#endif
+			if (!is_reply)
+				goto out;
+			identity = WORLD_ID;
+		} else {
+			identity = netidvalue->network_id;
+		}
+	}
+	if (mark_identity == identity) {
+		/* We saved mark_identity on this path. This indicates encapsulated host process packet. Wrap it up */
+		// TODO: Does this approach create any problems? Is there a better way? Can we and should we use skb control block?
+		goto out;
+	}
+
+	info = ipcache_lookup4(&IPCACHE_MAP, ip4->daddr, V4_CACHE_KEY_LEN);
+	if (info != NULL && info->tunnel_endpoint != 0) {
+		set_identity_mark(ctx, identity);
+		ret = encap_and_redirect_with_nodeid(ctx, info->tunnel_endpoint, info->key,
+							info->node_id, identity,
+							info->sec_label, trace);
+	} else {
+		//TODO: Are there actions to take here?
+	}
+out:
+	return ret;
+}
+#endif /* ENABLE_HOST_PROCESS_NETID */
 
 BPF_LICENSE("Dual BSD/GPL");

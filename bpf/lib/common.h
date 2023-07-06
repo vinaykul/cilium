@@ -1091,6 +1091,14 @@ struct lpm_val {
 	__u8 flags;
 };
 
+struct host_process_netid_key {
+	__u64 cgroup_id; /* cgroup id of the host process */
+};
+
+struct host_process_netid_value {
+	__u32 network_id; /* 24-bit network identity value for the host process */
+};
+
 #include "overloadable.h"
 
 #endif /* __LIB_COMMON_H_ */

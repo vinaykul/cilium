@@ -106,6 +106,8 @@ static int BPF_FUNC_REMAP(get_socket_opt, void *ctx, int level, int optname,
 
 static __u64 BPF_FUNC(get_current_cgroup_id);
 
+static __u64 BPF_FUNC(skb_cgroup_id, struct __sk_buff *skb);
+
 static int BPF_FUNC(set_retval, int retval);
 
 static inline int try_set_retval(int retval __maybe_unused)
