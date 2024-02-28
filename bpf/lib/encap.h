@@ -32,6 +32,28 @@ __encap_with_nodeid(struct __ctx_buff *ctx, __u32 src_ip, __be16 src_port,
 	if (seclabel == HOST_ID)
 		seclabel = LOCAL_NODE_ID;
 
+#ifdef ENABLE_HOST_PROCESS_NETID
+#if __ctx_is == __ctx_skb
+{
+	/* Lookup BPF map for host process or hostNetwork pod process cgroup-id <> network-id entry
+	 * If found, use it as network identity and encapsulate.
+	 * If not found, we can take actions based on policy. Choices we have:
+	 *   a) default allow without encap
+	 *   b) encap with WORLD_ID or UNMAMAGED_ID or something appropriate
+	 *   c) default drop
+	 */
+	__u64 cgroup_id = skb_cgroup_id(ctx);
+	struct host_process_netid_key netidkey;
+	struct host_process_netid_value *netidvalue;
+	netidkey.cgroup_id = cgroup_id;
+	netidvalue = map_lookup_elem(&HOST_PROCESS_NETID_MAP, &netidkey);
+	if (netidvalue != NULL) {
+		seclabel = netidvalue->network_id;
+	}
+}
+#endif /*  __ctx_is == __ctx_skb */
+#endif /* ENABLE_HOST_PROCESS_NETID */
+
 	node_id = bpf_ntohl(tunnel_endpoint);
 
 	cilium_dbg(ctx, DBG_ENCAP, node_id, seclabel);

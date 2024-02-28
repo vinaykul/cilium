@@ -87,3 +87,5 @@ add_type(struct tunnel_key);
 add_type(struct tunnel_value);
 add_type(struct auth_key);
 add_type(struct auth_info);
+add_type(struct host_process_netid_key);
+add_type(struct host_process_netid_value);
