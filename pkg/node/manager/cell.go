@@ -4,14 +4,13 @@
 package manager
 
 import (
-	"time"
-
+	"github.com/cilium/cilium/pkg/datapath/iptables/ipset"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
-	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 // Cell provides the NodeManager, which manages information about Cilium nodes
@@ -20,6 +19,7 @@ var Cell = cell.Module(
 	"node-manager",
 	"Manages the collection of Cilium nodes",
 	cell.Provide(newAllNodeManager),
+	cell.Metric(NewNodeMetrics),
 )
 
 // Notifier is the interface the wraps Subscribe and Unsubscribe. An
@@ -37,6 +37,8 @@ type Notifier interface {
 }
 
 type NodeManager interface {
+	datapath.NodeNeighborEnqueuer
+
 	Notifier
 
 	// GetNodes returns a copy of all the nodes as a map from Identity to Node.
@@ -62,13 +64,25 @@ type NodeManager interface {
 	// StartNeighborRefresh spawns a controller which refreshes neighbor table
 	// by sending arping periodically.
 	StartNeighborRefresh(nh datapath.NodeNeighbors)
+
+	// StartNodeNeighborLinkUpdater spawns a controller that watches a queue
+	// for node neighbor link updates.
+	StartNodeNeighborLinkUpdater(nh datapath.NodeNeighbors)
 }
 
-func newAllNodeManager(lc hive.Lifecycle, ipCache *ipcache.IPCache) (NodeManager, error) {
-	mngr, err := New("all", option.Config, ipCache)
+func newAllNodeManager(in struct {
+	cell.In
+	Lifecycle   cell.Lifecycle
+	IPCache     *ipcache.IPCache
+	IPSetMgr    ipset.Manager
+	IPSetFilter IPSetFilterFn `optional:"true"`
+	NodeMetrics *nodeMetrics
+	HealthScope cell.Scope
+}) (NodeManager, error) {
+	mngr, err := New(option.Config, in.IPCache, in.IPSetMgr, in.IPSetFilter, in.NodeMetrics, in.HealthScope)
 	if err != nil {
 		return nil, err
 	}
-	lc.Append(mngr)
+	in.Lifecycle.Append(mngr)
 	return mngr, nil
 }

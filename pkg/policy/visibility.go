@@ -67,7 +67,7 @@ func NewVisibilityPolicy(anno string) (*VisibilityPolicy, error) {
 
 		portInt, err := strconv.ParseUint(port, 10, 16)
 		if err != nil {
-			return nil, fmt.Errorf("unable to parse port: %s", err)
+			return nil, fmt.Errorf("unable to parse port: %w", err)
 		}
 
 		// Don't need to validate, regex already did that.
@@ -105,7 +105,7 @@ func NewVisibilityPolicy(anno string) (*VisibilityPolicy, error) {
 		}
 
 		for _, prot := range protos {
-			pp := fmt.Sprintf("%d/%s", portInt, prot.String())
+			pp := strconv.FormatUint(portInt, 10) + "/" + prot.String()
 			if res, ok := dvp[pp]; ok {
 				if res.Parser != l7Protocol {
 					return nil, fmt.Errorf("duplicate annotations with different L7 protocols %s and %s for %s", res.Parser, l7Protocol, pp)
@@ -133,7 +133,7 @@ func generateL7AllowAllRules(parser L7ParserType) L7DataMap {
 	case ParserTypeDNS:
 		m = L7DataMap{}
 		// Create an entry to explicitly allow all at L7 for DNS.
-		emptyL3Selector := &labelIdentitySelector{selectorManager: selectorManager{key: wildcardSelectorKey}, selector: api.WildcardEndpointSelector}
+		emptyL3Selector := &identitySelector{source: &labelIdentitySelector{selector: api.WildcardEndpointSelector}, key: wildcardSelectorKey}
 		m[emptyL3Selector] = &PerSelectorPolicy{
 			L7Rules: api.L7Rules{
 				DNS: []api.PortRuleDNS{
@@ -210,6 +210,11 @@ func (v *VisibilityMetadata) GetIngress() bool {
 // GetPort returns at which port the VisibilityMetadata applies.
 func (v *VisibilityMetadata) GetPort() uint16 {
 	return v.Port
+}
+
+// GetProtocol returns the protocol where the VisibilityMetadata applies.
+func (v *VisibilityMetadata) GetProtocol() uint8 {
+	return uint8(v.Proto)
 }
 
 // GetListener returns the optional listener name.

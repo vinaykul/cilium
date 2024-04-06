@@ -5,12 +5,12 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
-	"go.uber.org/multierr"
 
 	pb "github.com/cilium/cilium/api/v1/flow"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
@@ -103,7 +103,7 @@ func NewHandlers(log logrus.FieldLogger, registry *prometheus.Registry, in []Nam
 		}
 
 		if err := item.Handler.Init(registry, item.Options); err != nil {
-			return nil, fmt.Errorf("unable to initialize metric '%s': %s", item.Name, err)
+			return nil, fmt.Errorf("unable to initialize metric '%s': %w", item.Name, err)
 		}
 
 		log.WithFields(logrus.Fields{
@@ -117,14 +117,13 @@ func NewHandlers(log logrus.FieldLogger, registry *prometheus.Registry, in []Nam
 // ProcessFlow processes a flow by calling ProcessFlow it on to all enabled
 // metric handlers
 func (h Handlers) ProcessFlow(ctx context.Context, flow *pb.Flow) error {
-	var processingErr error
+	var errs error
 	for _, fp := range h.flowProcessors {
-		err := fp.ProcessFlow(ctx, flow)
 		// Continue running the remaining metrics handlers, since one failing
 		// shouldn't impact the other metrics handlers.
-		processingErr = multierr.Append(processingErr, err)
+		errs = errors.Join(errs, fp.ProcessFlow(ctx, flow))
 	}
-	return processingErr
+	return errs
 }
 
 // ProcessPodDeletion queries all handlers for a list of MetricVec and removes

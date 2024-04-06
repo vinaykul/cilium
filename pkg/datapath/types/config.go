@@ -11,19 +11,21 @@ import (
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/node"
+	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 )
+
+// NodeNeighborEnqueuer provides an interface for clients to push node updates
+// for further processing.
+type NodeNeighborEnqueuer interface {
+	// Enqueue enqueues a node for processing node neighbors updates.
+	Enqueue(*nodeTypes.Node, bool)
+}
 
 // DeviceConfiguration is an interface for injecting configuration of datapath
 // options that affect lookups and logic applied at a per-device level, whether
 // those are devices associated with the endpoint or associated with the host.
 type DeviceConfiguration interface {
-	// GetCIDRPrefixLengths fetches the lists of unique IPv6 and IPv4
-	// prefix lengths used for datapath lookups, each of which is sorted
-	// from longest prefix to shortest prefix. It must return more than
-	// one element in each returned array.
-	GetCIDRPrefixLengths() (s6, s4 []int)
-
 	// GetOptions fetches the configurable datapath options from the owner.
 	GetOptions() *option.IntOptions
 }
@@ -80,10 +82,6 @@ type CompileTimeConfiguration interface {
 
 	// IsHost returns true if the endpoint is the host endpoint.
 	IsHost() bool
-
-	// DisableSIPVerification returns true if the endpoint wishes to skip
-	// source IP verification
-	DisableSIPVerification() bool
 }
 
 // EndpointConfiguration provides datapath implementations a clean interface

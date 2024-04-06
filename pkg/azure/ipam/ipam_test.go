@@ -185,7 +185,7 @@ func (e *IPAMSuite) TestIpamPreAllocate8(c *check.C) {
 
 	cn := newCiliumNode("node1", "vm1", preAllocate, minAllocate)
 	statusRevision := k8sapi.statusRevision()
-	mngr.Update(cn)
+	mngr.Upsert(cn)
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node1", 0) }, 5*time.Second), check.IsNil)
 	// Wait for k8s status to be updated
 	c.Assert(testutils.WaitUntil(func() bool { return statusRevision < k8sapi.statusRevision() }, 5*time.Second), check.IsNil)
@@ -193,19 +193,19 @@ func (e *IPAMSuite) TestIpamPreAllocate8(c *check.C) {
 
 	node := mngr.Get("node1")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, preAllocate)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 0)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, preAllocate)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 0)
 
 	// Use 7 out of 8 IPs
-	mngr.Update(updateCiliumNode(k8sapi.getLatestNode("node1"), toUse))
+	mngr.Upsert(updateCiliumNode(k8sapi.getLatestNode("node1"), toUse))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node1", 0) }, 5*time.Second), check.IsNil)
 	// Wait for k8s status to be updated
 	c.Assert(testutils.WaitUntil(func() bool { return statusRevision < k8sapi.statusRevision() }, 5*time.Second), check.IsNil)
 
 	node = mngr.Get("node1")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, toUse+preAllocate)
-	c.Assert(node.Stats().UsedIPs, check.Equals, toUse)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, toUse+preAllocate)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, toUse)
 }
 
 // TestIpamMinAllocate10 tests IPAM with pre-allocation=8, min-allocate=10
@@ -247,7 +247,7 @@ func (e *IPAMSuite) TestIpamMinAllocate10(c *check.C) {
 
 	cn := newCiliumNode("node1", "vm1", preAllocate, minAllocate)
 	statusRevision := k8sapi.statusRevision()
-	mngr.Update(cn)
+	mngr.Upsert(cn)
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node1", 0) }, 5*time.Second), check.IsNil)
 	// Wait for k8s status to be updated
 	c.Assert(testutils.WaitUntil(func() bool { return statusRevision < k8sapi.statusRevision() }, 5*time.Second), check.IsNil)
@@ -255,19 +255,19 @@ func (e *IPAMSuite) TestIpamMinAllocate10(c *check.C) {
 
 	node := mngr.Get("node1")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, minAllocate)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 0)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, minAllocate)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 0)
 
 	// Use 7 out of 10 IPs
-	mngr.Update(updateCiliumNode(k8sapi.getLatestNode("node1"), toUse))
+	mngr.Upsert(updateCiliumNode(k8sapi.getLatestNode("node1"), toUse))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node1", 0) }, 5*time.Second), check.IsNil)
 	// Wait for k8s status to be updated
 	c.Assert(testutils.WaitUntil(func() bool { return statusRevision < k8sapi.statusRevision() }, 5*time.Second), check.IsNil)
 
 	node = mngr.Get("node1")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, toUse+preAllocate)
-	c.Assert(node.Stats().UsedIPs, check.Equals, toUse)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, toUse+preAllocate)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, toUse)
 
 	quota := instances.GetPoolQuota()
 	c.Assert(len(quota), check.Equals, 1)
@@ -319,7 +319,7 @@ func (e *IPAMSuite) TestIpamManyNodes(c *check.C) {
 	for i := range state {
 		state[i] = &nodeState{name: fmt.Sprintf("node%d", i), instanceName: fmt.Sprintf("vm%d", i)}
 		state[i].cn = newCiliumNode(state[i].name, state[i].instanceName, 1, minAllocate)
-		mngr.Update(state[i].cn)
+		mngr.Upsert(state[i].cn)
 	}
 
 	for _, s := range state {
@@ -327,11 +327,11 @@ func (e *IPAMSuite) TestIpamManyNodes(c *check.C) {
 
 		node := mngr.Get(s.name)
 		c.Assert(node, check.Not(check.IsNil))
-		if node.Stats().AvailableIPs != minAllocate {
-			c.Errorf("Node %s allocation mismatch. expected: %d allocated: %d", s.name, minAllocate, node.Stats().AvailableIPs)
+		if node.Stats().IPv4.AvailableIPs != minAllocate {
+			c.Errorf("Node %s allocation mismatch. expected: %d allocated: %d", s.name, minAllocate, node.Stats().IPv4.AvailableIPs)
 			c.Fail()
 		}
-		c.Assert(node.Stats().UsedIPs, check.Equals, 0)
+		c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 0)
 	}
 
 	// The above check returns as soon as the address requirements are met.
@@ -395,7 +395,7 @@ func benchmarkAllocWorker(c *check.C, workers int64, delay time.Duration, rateLi
 	for i := range state {
 		state[i] = &nodeState{name: fmt.Sprintf("node%d", i), instanceName: fmt.Sprintf("vm%d", i)}
 		state[i].cn = newCiliumNode(state[i].name, state[i].instanceName, 1, 10)
-		mngr.Update(state[i].cn)
+		mngr.Upsert(state[i].cn)
 	}
 
 restart:

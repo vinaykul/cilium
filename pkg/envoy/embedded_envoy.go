@@ -5,6 +5,7 @@ package envoy
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cilium/lumberjack/v2"
 	cilium "github.com/cilium/proxy/go/cilium/api"
@@ -20,6 +20,7 @@ import (
 	envoy_config_cluster "github.com/cilium/proxy/go/envoy/config/cluster/v3"
 	envoy_config_core "github.com/cilium/proxy/go/envoy/config/core/v3"
 	envoy_config_endpoint "github.com/cilium/proxy/go/envoy/config/endpoint/v3"
+	envoy_extensions_bootstrap_internal_listener_v3 "github.com/cilium/proxy/go/envoy/extensions/bootstrap/internal_listener/v3"
 	envoy_config_upstream "github.com/cilium/proxy/go/envoy/extensions/upstreams/http/v3"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
@@ -32,7 +33,7 @@ import (
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
-	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 var log = logging.DefaultLogger.WithField(logfields.LogSubsys, "envoy-manager")
@@ -53,7 +54,8 @@ var (
 )
 
 const (
-	ciliumEnvoy = "cilium-envoy"
+	ciliumEnvoyStarter = "cilium-envoy-starter"
+	ciliumEnvoy        = "cilium-envoy"
 )
 
 // EnableTracing changes Envoy log level to "trace", producing the most logs.
@@ -81,25 +83,41 @@ type EmbeddedEnvoy struct {
 	admin  *EnvoyAdminClient
 }
 
-// StartEmbeddedEnvoy starts an Envoy proxy instance.
-func StartEmbeddedEnvoy(runDir, logPath string, baseID uint64) *EmbeddedEnvoy {
-	e := &EmbeddedEnvoy{
+type embeddedEnvoyConfig struct {
+	runDir                   string
+	logPath                  string
+	baseID                   uint64
+	connectTimeout           int64
+	maxRequestsPerConnection uint32
+	maxConnectionDuration    time.Duration
+	idleTimeout              time.Duration
+}
+
+// startEmbeddedEnvoy starts an Envoy proxy instance.
+func startEmbeddedEnvoy(config embeddedEnvoyConfig) (*EmbeddedEnvoy, error) {
+	envoy := &EmbeddedEnvoy{
 		stopCh: make(chan struct{}),
 		errCh:  make(chan error, 1),
-		admin:  NewEnvoyAdminClientForSocket(GetSocketDir(runDir)),
+		admin:  NewEnvoyAdminClientForSocket(GetSocketDir(config.runDir)),
 	}
 
-	// Use the same structure as Istio's pilot-agent for the node ID:
-	// nodeType~ipAddress~proxyId~domain
-	nodeId := "host~127.0.0.1~no-id~localdomain"
-	bootstrapPath := filepath.Join(runDir, "envoy", "bootstrap.pb")
-	xdsSocketPath := getXDSSocketPath(GetSocketDir(runDir))
+	bootstrapFilePath := filepath.Join(config.runDir, "envoy", "bootstrap.pb")
 
-	// Create static configuration
-	createBootstrap(bootstrapPath, nodeId, ingressClusterName,
-		xdsSocketPath, egressClusterName, ingressClusterName, getAdminSocketPath(GetSocketDir(runDir)))
+	writeBootstrapConfigFile(bootstrapConfig{
+		filePath:                 bootstrapFilePath,
+		nodeId:                   "host~127.0.0.1~no-id~localdomain", // node id format inherited from Istio
+		cluster:                  ingressClusterName,
+		adminPath:                getAdminSocketPath(GetSocketDir(config.runDir)),
+		xdsSock:                  getXDSSocketPath(GetSocketDir(config.runDir)),
+		egressClusterName:        egressClusterName,
+		ingressClusterName:       ingressClusterName,
+		connectTimeout:           config.connectTimeout,
+		maxRequestsPerConnection: config.maxRequestsPerConnection,
+		maxConnectionDuration:    config.maxConnectionDuration,
+		idleTimeout:              config.idleTimeout,
+	})
 
-	log.Debugf("Envoy: Starting: %v", *e)
+	log.Debugf("Envoy: Starting: %v", *envoy)
 
 	// make it a buffered channel, so we can not only
 	// read the written value but also skip it in
@@ -108,14 +126,14 @@ func StartEmbeddedEnvoy(runDir, logPath string, baseID uint64) *EmbeddedEnvoy {
 	go func() {
 		var logWriter io.WriteCloser
 		var logFormat string
-		if logPath != "" {
+		if config.logPath != "" {
 			// Use the Envoy default log format when logging to a separate file
 			logFormat = "[%Y-%m-%d %T.%e][%t][%l][%n] %v"
 			logger := &lumberjack.Logger{
-				Filename:   logPath,
+				Filename:   config.logPath,
 				MaxSize:    100, // megabytes
 				MaxBackups: 3,
-				MaxAge:     28,   //days
+				MaxAge:     28,   // days
 				Compress:   true, // disabled by default
 			}
 			logWriter = logger
@@ -134,7 +152,7 @@ func StartEmbeddedEnvoy(runDir, logPath string, baseID uint64) *EmbeddedEnvoy {
 
 		for {
 			logLevel := logging.GetLevel(logging.DefaultLogger)
-			cmd := exec.Command(ciliumEnvoy, "-l", mapLogLevel(logLevel), "-c", bootstrapPath, "--base-id", strconv.FormatUint(baseID, 10), "--log-format", logFormat)
+			cmd := exec.Command(ciliumEnvoyStarter, "-l", mapLogLevel(logLevel), "-c", bootstrapFilePath, "--base-id", strconv.FormatUint(config.baseID, 10), "--log-format", logFormat)
 			cmd.Stderr = logWriter
 			cmd.Stdout = logWriter
 
@@ -153,7 +171,7 @@ func StartEmbeddedEnvoy(runDir, logPath string, baseID uint64) *EmbeddedEnvoy {
 			}
 
 			log.Infof("Envoy: Proxy started with pid %d", cmd.Process.Pid)
-			metrics.SubprocessStart.WithLabelValues(ciliumEnvoy).Inc()
+			metrics.SubprocessStart.WithLabelValues(ciliumEnvoyStarter).Inc()
 
 			// We do not return after a successful start, but watch the Envoy process
 			// and restart it if it crashes.
@@ -176,27 +194,27 @@ func StartEmbeddedEnvoy(runDir, logPath string, baseID uint64) *EmbeddedEnvoy {
 			case <-crashCh:
 				// Start Envoy again
 				continue
-			case <-e.stopCh:
+			case <-envoy.stopCh:
 				log.Infof("Envoy: Stopping proxy with pid %d", cmd.Process.Pid)
-				if err := e.admin.quit(); err != nil {
+				if err := envoy.admin.quit(); err != nil {
 					log.WithError(err).Fatalf("Envoy: Envoy admin quit failed, killing process with pid %d", cmd.Process.Pid)
 
 					if err := cmd.Process.Kill(); err != nil {
 						log.WithError(err).Fatal("Envoy: Stopping Envoy failed")
-						e.errCh <- err
+						envoy.errCh <- err
 					}
 				}
-				close(e.errCh)
+				close(envoy.errCh)
 				return
 			}
 		}
 	}()
 
 	if <-started {
-		return e
+		return envoy, nil
 	}
 
-	return nil
+	return nil, errors.New("failed to start embedded Envoy server")
 }
 
 // newEnvoyLogPiper creates a writer that parses and logs log messages written by Envoy.
@@ -245,9 +263,8 @@ func newEnvoyLogPiper() io.WriteCloser {
 			case "off", "critical", "error":
 				scopedLog.Error(msg)
 			case "warning":
-				// Silently drop expected warnings if flowdebug is not enabled
-				// TODO: Remove this special case when https://github.com/envoyproxy/envoy/issues/13504 is fixed.
-				if !flowdebug.Enabled() && strings.Contains(msg, "Unable to use runtime singleton for feature envoy.http.headermap.lazy_map_min_size") {
+				if !tracing && (strings.Contains(msg, "Usage of the deprecated runtime key overload.global_downstream_max_connections, consider switching to `envoy.resource_monitors.downstream_connections` instead.This runtime key will be removed in future.") ||
+					strings.Contains(msg, "There is no configured limit to the number of allowed active downstream connections. Configure a limit in `envoy.resource_monitors.downstream_connections` resource monitor.")) {
 					continue
 				}
 				scopedLog.Warn(msg)
@@ -267,7 +284,7 @@ func newEnvoyLogPiper() io.WriteCloser {
 	return writer
 }
 
-// Stop kills the Envoy process started with StartEmbeddedEnvoy. The gRPC API streams are terminated
+// Stop kills the Envoy process started with startEmbeddedEnvoy. The gRPC API streams are terminated
 // first.
 func (e *EmbeddedEnvoy) Stop() error {
 	close(e.stopCh)
@@ -282,18 +299,27 @@ func (e *EmbeddedEnvoy) GetAdminClient() *EnvoyAdminClient {
 	return e.admin
 }
 
-func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClusterName, ingressClusterName string, adminPath string) {
-	connectTimeout := int64(option.Config.ProxyConnectTimeout) // in seconds
-	maxRequestsPerConnection := uint32(option.Config.ProxyMaxRequestsPerConnection)
-	maxConnectionDuration := option.Config.ProxyMaxConnectionDuration * time.Second
-	idleTimeout := option.Config.ProxyIdleTimeout * time.Second
+type bootstrapConfig struct {
+	filePath                 string
+	nodeId                   string
+	cluster                  string
+	adminPath                string
+	xdsSock                  string
+	egressClusterName        string
+	ingressClusterName       string
+	connectTimeout           int64
+	maxRequestsPerConnection uint32
+	maxConnectionDuration    time.Duration
+	idleTimeout              time.Duration
+}
 
+func writeBootstrapConfigFile(config bootstrapConfig) {
 	useDownstreamProtocol := map[string]*anypb.Any{
 		"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": toAny(&envoy_config_upstream.HttpProtocolOptions{
 			CommonHttpProtocolOptions: &envoy_config_core.HttpProtocolOptions{
-				IdleTimeout:              durationpb.New(idleTimeout),
-				MaxRequestsPerConnection: wrapperspb.UInt32(maxRequestsPerConnection),
-				MaxConnectionDuration:    durationpb.New(maxConnectionDuration),
+				IdleTimeout:              durationpb.New(config.idleTimeout),
+				MaxRequestsPerConnection: wrapperspb.UInt32(config.maxRequestsPerConnection),
+				MaxConnectionDuration:    durationpb.New(config.maxConnectionDuration),
 			},
 			UpstreamProtocolOptions: &envoy_config_upstream.HttpProtocolOptions_UseDownstreamProtocolConfig{
 				UseDownstreamProtocolConfig: &envoy_config_upstream.HttpProtocolOptions_UseDownstreamHttpConfig{},
@@ -309,9 +335,9 @@ func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClu
 				//	downstream to upstream.
 			},
 			CommonHttpProtocolOptions: &envoy_config_core.HttpProtocolOptions{
-				IdleTimeout:              durationpb.New(idleTimeout),
-				MaxRequestsPerConnection: wrapperspb.UInt32(maxRequestsPerConnection),
-				MaxConnectionDuration:    durationpb.New(maxConnectionDuration),
+				IdleTimeout:              durationpb.New(config.idleTimeout),
+				MaxRequestsPerConnection: wrapperspb.UInt32(config.maxRequestsPerConnection),
+				MaxConnectionDuration:    durationpb.New(config.maxConnectionDuration),
 			},
 			UpstreamProtocolOptions: &envoy_config_upstream.HttpProtocolOptions_UseDownstreamProtocolConfig{
 				UseDownstreamProtocolConfig: &envoy_config_upstream.HttpProtocolOptions_UseDownstreamHttpConfig{},
@@ -330,22 +356,22 @@ func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClu
 	}
 
 	bs := &envoy_config_bootstrap.Bootstrap{
-		Node: &envoy_config_core.Node{Id: nodeId, Cluster: cluster},
+		Node: &envoy_config_core.Node{Id: config.nodeId, Cluster: config.cluster},
 		StaticResources: &envoy_config_bootstrap.Bootstrap_StaticResources{
 			Clusters: []*envoy_config_cluster.Cluster{
 				{
 					Name:                          egressClusterName,
 					ClusterDiscoveryType:          &envoy_config_cluster.Cluster_Type{Type: envoy_config_cluster.Cluster_ORIGINAL_DST},
-					ConnectTimeout:                &durationpb.Duration{Seconds: connectTimeout, Nanos: 0},
-					CleanupInterval:               &durationpb.Duration{Seconds: connectTimeout, Nanos: 500000000},
+					ConnectTimeout:                &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 0},
+					CleanupInterval:               &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 500000000},
 					LbPolicy:                      envoy_config_cluster.Cluster_CLUSTER_PROVIDED,
 					TypedExtensionProtocolOptions: useDownstreamProtocol,
 				},
 				{
 					Name:                          egressTLSClusterName,
 					ClusterDiscoveryType:          &envoy_config_cluster.Cluster_Type{Type: envoy_config_cluster.Cluster_ORIGINAL_DST},
-					ConnectTimeout:                &durationpb.Duration{Seconds: connectTimeout, Nanos: 0},
-					CleanupInterval:               &durationpb.Duration{Seconds: connectTimeout, Nanos: 500000000},
+					ConnectTimeout:                &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 0},
+					CleanupInterval:               &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 500000000},
 					LbPolicy:                      envoy_config_cluster.Cluster_CLUSTER_PROVIDED,
 					TypedExtensionProtocolOptions: useDownstreamProtocolAutoSNI,
 					TransportSocket: &envoy_config_core.TransportSocket{
@@ -358,16 +384,16 @@ func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClu
 				{
 					Name:                          ingressClusterName,
 					ClusterDiscoveryType:          &envoy_config_cluster.Cluster_Type{Type: envoy_config_cluster.Cluster_ORIGINAL_DST},
-					ConnectTimeout:                &durationpb.Duration{Seconds: connectTimeout, Nanos: 0},
-					CleanupInterval:               &durationpb.Duration{Seconds: connectTimeout, Nanos: 500000000},
+					ConnectTimeout:                &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 0},
+					CleanupInterval:               &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 500000000},
 					LbPolicy:                      envoy_config_cluster.Cluster_CLUSTER_PROVIDED,
 					TypedExtensionProtocolOptions: useDownstreamProtocol,
 				},
 				{
 					Name:                          ingressTLSClusterName,
 					ClusterDiscoveryType:          &envoy_config_cluster.Cluster_Type{Type: envoy_config_cluster.Cluster_ORIGINAL_DST},
-					ConnectTimeout:                &durationpb.Duration{Seconds: connectTimeout, Nanos: 0},
-					CleanupInterval:               &durationpb.Duration{Seconds: connectTimeout, Nanos: 500000000},
+					ConnectTimeout:                &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 0},
+					CleanupInterval:               &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 500000000},
 					LbPolicy:                      envoy_config_cluster.Cluster_CLUSTER_PROVIDED,
 					TypedExtensionProtocolOptions: useDownstreamProtocolAutoSNI,
 					TransportSocket: &envoy_config_core.TransportSocket{
@@ -380,7 +406,7 @@ func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClu
 				{
 					Name:                 CiliumXDSClusterName,
 					ClusterDiscoveryType: &envoy_config_cluster.Cluster_Type{Type: envoy_config_cluster.Cluster_STATIC},
-					ConnectTimeout:       &durationpb.Duration{Seconds: connectTimeout, Nanos: 0},
+					ConnectTimeout:       &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 0},
 					LbPolicy:             envoy_config_cluster.Cluster_ROUND_ROBIN,
 					LoadAssignment: &envoy_config_endpoint.ClusterLoadAssignment{
 						ClusterName: CiliumXDSClusterName,
@@ -390,7 +416,8 @@ func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClu
 									Endpoint: &envoy_config_endpoint.Endpoint{
 										Address: &envoy_config_core.Address{
 											Address: &envoy_config_core.Address_Pipe{
-												Pipe: &envoy_config_core.Pipe{Path: xdsSock}},
+												Pipe: &envoy_config_core.Pipe{Path: config.xdsSock},
+											},
 										},
 									},
 								},
@@ -402,7 +429,7 @@ func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClu
 				{
 					Name:                 adminClusterName,
 					ClusterDiscoveryType: &envoy_config_cluster.Cluster_Type{Type: envoy_config_cluster.Cluster_STATIC},
-					ConnectTimeout:       &durationpb.Duration{Seconds: connectTimeout, Nanos: 0},
+					ConnectTimeout:       &durationpb.Duration{Seconds: config.connectTimeout, Nanos: 0},
 					LbPolicy:             envoy_config_cluster.Cluster_ROUND_ROBIN,
 					LoadAssignment: &envoy_config_endpoint.ClusterLoadAssignment{
 						ClusterName: adminClusterName,
@@ -412,7 +439,8 @@ func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClu
 									Endpoint: &envoy_config_endpoint.Endpoint{
 										Address: &envoy_config_core.Address{
 											Address: &envoy_config_core.Address_Pipe{
-												Pipe: &envoy_config_core.Pipe{Path: adminPath}},
+												Pipe: &envoy_config_core.Pipe{Path: config.adminPath},
+											},
 										},
 									},
 								},
@@ -423,14 +451,20 @@ func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClu
 			},
 		},
 		DynamicResources: &envoy_config_bootstrap.Bootstrap_DynamicResources{
-			LdsConfig: ciliumXDS,
-			CdsConfig: ciliumXDS,
+			LdsConfig: CiliumXDSConfigSource,
+			CdsConfig: CiliumXDSConfigSource,
 		},
 		Admin: &envoy_config_bootstrap.Admin{
 			Address: &envoy_config_core.Address{
 				Address: &envoy_config_core.Address_Pipe{
-					Pipe: &envoy_config_core.Pipe{Path: adminPath},
+					Pipe: &envoy_config_core.Pipe{Path: config.adminPath},
 				},
+			},
+		},
+		BootstrapExtensions: []*envoy_config_core.TypedExtensionConfig{
+			{
+				Name:        "envoy.bootstrap.internal_listener",
+				TypedConfig: toAny(&envoy_extensions_bootstrap_internal_listener_v3.InternalListener{}),
 			},
 		},
 		LayeredRuntime: &envoy_config_bootstrap.LayeredRuntime{
@@ -454,8 +488,24 @@ func createBootstrap(filePath string, nodeId, cluster string, xdsSock, egressClu
 	if err != nil {
 		log.WithError(err).Fatal("Envoy: Error marshaling Envoy bootstrap")
 	}
-	err = os.WriteFile(filePath, data, 0644)
+	err = os.WriteFile(config.filePath, data, 0644)
 	if err != nil {
 		log.WithError(err).Fatal("Envoy: Error writing Envoy bootstrap file")
 	}
+}
+
+// getEmbeddedEnvoyVersion returns the envoy binary version string
+func getEmbeddedEnvoyVersion() (string, error) {
+	out, err := exec.Command(ciliumEnvoy, "--version").Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to execute '%s --version': %w", ciliumEnvoy, err)
+	}
+	envoyVersionString := strings.TrimSpace(string(out))
+
+	envoyVersionArray := strings.Fields(envoyVersionString)
+	if len(envoyVersionArray) < 3 {
+		return "", fmt.Errorf("failed to extract version from truncated Envoy version string")
+	}
+
+	return envoyVersionArray[2], nil
 }

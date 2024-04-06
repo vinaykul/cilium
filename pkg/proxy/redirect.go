@@ -5,9 +5,10 @@ package proxy
 
 import (
 	"github.com/cilium/cilium/pkg/completion"
+	"github.com/cilium/cilium/pkg/fqdn/restore"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/policy"
-	"github.com/cilium/cilium/pkg/proxy/logger"
+	"github.com/cilium/cilium/pkg/proxy/endpoint"
 	"github.com/cilium/cilium/pkg/revert"
 )
 
@@ -28,25 +29,14 @@ type RedirectImplementation interface {
 	Close(wg *completion.WaitGroup) (revert.FinalizeFunc, revert.RevertFunc)
 }
 
-// Redirect type for custom Listeners, which are managed externally.
-type CRDRedirect struct{}
-
-func (r *CRDRedirect) UpdateRules(wg *completion.WaitGroup) (revert.RevertFunc, error) {
-	return func() error { return nil }, nil
-}
-
-func (r *CRDRedirect) Close(wg *completion.WaitGroup) (revert.FinalizeFunc, revert.RevertFunc) {
-	return nil, func() error { return nil }
-}
-
 type Redirect struct {
 	// The following fields are only written to during initialization, it
 	// is safe to read these fields without locking the mutex
 	name           string
 	listener       *ProxyPort
-	dstPort        uint16
+	dstPortProto   restore.PortProto
 	endpointID     uint64
-	localEndpoint  logger.EndpointUpdater
+	localEndpoint  endpoint.EndpointUpdater
 	implementation RedirectImplementation
 
 	// The following fields are updated while the redirect is alive, the
@@ -55,11 +45,11 @@ type Redirect struct {
 	rules policy.L7DataMap
 }
 
-func newRedirect(localEndpoint logger.EndpointUpdater, name string, listener *ProxyPort, dstPort uint16) *Redirect {
+func newRedirect(localEndpoint endpoint.EndpointUpdater, name string, listener *ProxyPort, port uint16, proto uint8) *Redirect {
 	return &Redirect{
 		name:          name,
 		listener:      listener,
-		dstPort:       dstPort,
+		dstPortProto:  restore.MakeV2PortProto(port, proto),
 		endpointID:    localEndpoint.GetID(),
 		localEndpoint: localEndpoint,
 	}

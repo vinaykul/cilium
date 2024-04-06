@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/netip"
 	"sync"
 	"sync/atomic"
 
@@ -43,7 +42,7 @@ type PolicyContext interface {
 
 	// GetEnvoyHTTPRules translates the given 'api.L7Rules' into
 	// the protobuf representation the Envoy can consume. The bool
-	// return parameter tells whether the the rule enforcement can
+	// return parameter tells whether the rule enforcement can
 	// be short-circuited upon the first allowing rule. This is
 	// false if any of the rules has side-effects, requiring all
 	// such rules being evaluated.
@@ -111,10 +110,13 @@ type Repository struct {
 	Mutex lock.RWMutex
 	rules ruleSlice
 
+	// rulesIndexByK8sUID indexes the rules by k8s UID.
+	rulesIndexByK8sUID map[string]*rule
+
 	// revision is the revision of the policy repository. It will be
 	// incremented whenever the policy repository is changed.
 	// Always positive (>0).
-	revision uint64
+	revision atomic.Uint64
 
 	// RepositoryChangeQueue is a queue which serializes changes to the policy
 	// repository.
@@ -142,6 +144,11 @@ type Repository struct {
 // GetSelectorCache() returns the selector cache used by the Repository
 func (p *Repository) GetSelectorCache() *SelectorCache {
 	return p.selectorCache
+}
+
+// GetAuthTypes returns the AuthTypes required by the policy between the localID and remoteID
+func (p *Repository) GetAuthTypes(localID, remoteID identity.NumericIdentity) AuthTypes {
+	return p.policyCache.GetAuthTypes(localID, remoteID)
 }
 
 func (p *Repository) SetEnvoyRulesFunc(f func(certificatemanager.SecretManager, *api.L7Rules, string) (*cilium.HttpNetworkPolicyRules, bool)) {
@@ -185,11 +192,12 @@ func NewStoppedPolicyRepository(
 ) *Repository {
 	selectorCache := NewSelectorCache(idAllocator, idCache)
 	repo := &Repository{
-		revision:      1,
-		selectorCache: selectorCache,
-		certManager:   certManager,
-		secretManager: secretManager,
+		rulesIndexByK8sUID: map[string]*rule{},
+		selectorCache:      selectorCache,
+		certManager:        certManager,
+		secretManager:      secretManager,
 	}
+	repo.revision.Store(1)
 	repo.policyCache = NewPolicyCache(repo, true)
 	return repo
 }
@@ -253,7 +261,7 @@ func (p *Repository) Start() {
 //
 // Caller must release resources by calling Detach() on the returned map!
 //
-// Note: Only used for policy tracing
+// NOTE: This is only called from unit tests, but from multiple packages.
 func (p *Repository) ResolveL4IngressPolicy(ctx *SearchContext) (L4PolicyMap, error) {
 	policyCtx := policyContext{
 		repo: p,
@@ -295,6 +303,8 @@ func (p *Repository) ResolveL4EgressPolicy(ctx *SearchContext) (L4PolicyMap, err
 // context and returns the verdict for ingress. If no matching policy allows for
 // the  connection, the request will be denied. The policy repository mutex must
 // be held.
+//
+// NOTE: This is only called from unit tests, but from multiple packages.
 func (p *Repository) AllowsIngressRLocked(ctx *SearchContext) api.Decision {
 	// Lack of DPorts in the SearchContext means L3-only search
 	if len(ctx.DPorts) == 0 {
@@ -360,6 +370,13 @@ func (p *Repository) AllowsEgressRLocked(ctx *SearchContext) api.Decision {
 func (p *Repository) SearchRLocked(lbls labels.LabelArray) api.Rules {
 	result := api.Rules{}
 
+	if uid := lbls.Get(labels.LabelSourceK8sKeyPrefix + k8sConst.PolicyLabelUID); uid != "" {
+		r, ok := p.rulesIndexByK8sUID[uid]
+		if ok {
+			result = append(result, &r.Rule)
+		}
+		return result
+	}
 	for _, r := range p.rules {
 		if r.Labels.Contains(lbls) {
 			result = append(result, &r.Rule)
@@ -374,7 +391,7 @@ func (p *Repository) SearchRLocked(lbls labels.LabelArray) api.Rules {
 // TODO: this should be in a test_helpers.go file or something similar
 // so we can clearly delineate what helpers are for testing.
 // NOTE: This is only called from unit tests, but from multiple packages.
-func (p *Repository) Add(r api.Rule, localRuleConsumers []Endpoint) (uint64, map[uint16]struct{}, error) {
+func (p *Repository) Add(r api.Rule) (uint64, map[uint16]struct{}, error) {
 	p.Mutex.Lock()
 	defer p.Mutex.Unlock()
 
@@ -399,6 +416,9 @@ func (p *Repository) AddListLocked(rules api.Rules) (ruleSlice, uint64) {
 			metadata: newRuleMetadata(),
 		}
 		newList[i] = newRule
+		if uid := rules[i].Labels.Get(labels.LabelSourceK8sKeyPrefix + k8sConst.PolicyLabelUID); uid != "" {
+			p.rulesIndexByK8sUID[uid] = newRule
+		}
 	}
 
 	p.rules = append(p.rules, newList...)
@@ -446,6 +466,10 @@ func (p *Repository) LocalEndpointIdentityRemoved(identity *identity.Identity) {
 // AddList inserts a rule into the policy repository. It is used for
 // unit-testing purposes only.
 func (p *Repository) AddList(rules api.Rules) (ruleSlice, uint64) {
+	for i := range rules {
+		// FIXME(GH-31162): Many unit tests provide invalid rules
+		_ = rules[i].Sanitize()
+	}
 	p.Mutex.Lock()
 	defer p.Mutex.Unlock()
 	return p.AddListLocked(rules)
@@ -509,6 +533,9 @@ func (p *Repository) DeleteByLabelsLocked(lbls labels.LabelArray) (ruleSlice, ui
 	if deleted > 0 {
 		p.BumpRevision()
 		p.rules = new
+		if uid := lbls.Get(labels.LabelSourceK8sKeyPrefix + k8sConst.PolicyLabelUID); uid != "" {
+			delete(p.rulesIndexByK8sUID, uid)
+		}
 		metrics.Policy.Sub(float64(deleted))
 	}
 
@@ -579,38 +606,6 @@ func (p *Repository) GetRulesMatching(lbls labels.LabelArray) (ingressMatch bool
 	return
 }
 
-// getMatchingRules returns whether any of the rules in a repository contain a
-// rule with labels matching the given security identity, as well as
-// a slice of all rules which match.
-//
-// Must be called with p.Mutex held
-func (p *Repository) getMatchingRules(securityIdentity *identity.Identity) (
-	ingressMatch, egressMatch bool,
-	matchingRules ruleSlice) {
-
-	matchingRules = []*rule{}
-	for _, r := range p.rules {
-		isNode := securityIdentity.ID == identity.ReservedIdentityHost
-		selectsNode := r.NodeSelector.LabelSelector != nil
-		if selectsNode != isNode {
-			continue
-		}
-		if ruleMatches := r.matches(securityIdentity); ruleMatches {
-			// Don't need to update whether ingressMatch is true if it already
-			// has been determined to be true - allows us to not have to check
-			// lenth of slice.
-			if !ingressMatch {
-				ingressMatch = len(r.Ingress) > 0 || len(r.IngressDeny) > 0
-			}
-			if !egressMatch {
-				egressMatch = len(r.Egress) > 0 || len(r.EgressDeny) > 0
-			}
-			matchingRules = append(matchingRules, r)
-		}
-	}
-	return
-}
-
 // NumRules returns the amount of rules in the policy repository.
 //
 // Must be called with p.Mutex held
@@ -620,7 +615,7 @@ func (p *Repository) NumRules() int {
 
 // GetRevision returns the revision of the policy repository
 func (p *Repository) GetRevision() uint64 {
-	return atomic.LoadUint64(&p.revision)
+	return p.revision.Load()
 }
 
 // Empty returns 'true' if repository has no rules, 'false' otherwise.
@@ -632,42 +627,10 @@ func (p *Repository) Empty() bool {
 	return p.NumRules() == 0
 }
 
-// TranslationResult contains the results of the rule translation
-type TranslationResult struct {
-	// NumToServicesRules is the number of ToServices rules processed while
-	// translating the rules
-	NumToServicesRules int
-
-	// BackendPrefixes contains all egress CIDRs that are to be added
-	// for the translation.
-	PrefixesToAdd []netip.Prefix
-
-	// BackendPrefixes contains all egress CIDRs that are to be removed
-	// for the translation.
-	PrefixesToRelease []netip.Prefix
-}
-
-// TranslateRules traverses rules and applies provided translator to rules
-//
-// Note: Only used by the k8s watcher.
-func (p *Repository) TranslateRules(translator Translator) (*TranslationResult, error) {
-	p.Mutex.Lock()
-	defer p.Mutex.Unlock()
-
-	result := &TranslationResult{}
-
-	for ruleIndex := range p.rules {
-		if err := translator.Translate(&p.rules[ruleIndex].Rule, result); err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
 // BumpRevision allows forcing policy regeneration
 func (p *Repository) BumpRevision() {
 	metrics.PolicyRevision.Inc()
-	atomic.AddUint64(&p.revision, 1)
+	p.revision.Add(1)
 }
 
 // GetRulesList returns the current policy
@@ -733,7 +696,7 @@ func (p *Repository) resolvePolicyLocked(securityIdentity *identity.Identity) (*
 		if err != nil {
 			return nil, err
 		}
-		calculatedPolicy.L4Policy.Ingress = newL4IngressPolicy
+		calculatedPolicy.L4Policy.Ingress.PortRules = newL4IngressPolicy
 	}
 
 	if egressEnabled {
@@ -741,7 +704,7 @@ func (p *Repository) resolvePolicyLocked(securityIdentity *identity.Identity) (*
 		if err != nil {
 			return nil, err
 		}
-		calculatedPolicy.L4Policy.Egress = newL4EgressPolicy
+		calculatedPolicy.L4Policy.Egress.PortRules = newL4EgressPolicy
 	}
 
 	// Make the calculated policy ready for incremental updates
@@ -765,27 +728,117 @@ func (p *Repository) computePolicyEnforcementAndRules(securityIdentity *identity
 	if lbls.Has(labels.IDNameHost) && !option.Config.EnableHostFirewall {
 		return false, false, nil
 	}
-	switch GetPolicyEnabled() {
-	case option.AlwaysEnforce:
-		_, _, matchingRules = p.getMatchingRules(securityIdentity)
-		// If policy enforcement is enabled for the daemon, then it has to be
-		// enabled for the endpoint.
-		return true, true, matchingRules
-	case option.DefaultEnforcement:
-		ingress, egress, matchingRules = p.getMatchingRules(securityIdentity)
-		// If the endpoint has the reserved:init label, i.e. if it has not yet
-		// received any labels, always enforce policy (default deny).
-		if lbls.Has(labels.IDNameInit) {
-			return true, true, matchingRules
-		}
 
-		// Default mode means that if rules contain labels that match this
-		// endpoint, then enable policy enforcement for this endpoint.
-		return ingress, egress, matchingRules
-	default:
-		// If policy enforcement isn't enabled, we do not enable policy
-		// enforcement for the endpoint. We don't care about returning any
-		// rules that match.
+	policyMode := GetPolicyEnabled()
+	// If policy enforcement isn't enabled, we do not enable policy
+	// enforcement for the endpoint. We don't care about returning any
+	// rules that match.
+	if policyMode == option.NeverEnforce {
 		return false, false, nil
 	}
+
+	matchingRules = []*rule{}
+	for _, r := range p.rules {
+		if r.matches(securityIdentity) {
+			matchingRules = append(matchingRules, r)
+		}
+	}
+
+	// If policy enforcement is enabled for the daemon, then it has to be
+	// enabled for the endpoint.
+	// If the endpoint has the reserved:init label, i.e. if it has not yet
+	// received any labels, always enforce policy (default deny).
+	if policyMode == option.AlwaysEnforce || lbls.Has(labels.IDNameInit) {
+		return true, true, matchingRules
+	}
+
+	// Determine the default policy for each direction.
+	//
+	// By default, endpoints have no policy and all traffic is allowed.
+	// If any rules select the endpoint, then the endpoint switches to a
+	// default-deny mode (same as traffic being enabled), per-direction.
+	//
+	// Rules, however, can optionally be configure to not enable default deny mode.
+	// If no rules enable default-deny, then all traffic is allowed except that explicitly
+	// denied by a Deny rule.
+	//
+	// There are three possible cases _per direction_:
+	// 1: No rules are present,
+	// 2: At least one default-deny rule is present. Then, policy is enabled
+	// 3: Only non-default-deny rules are present. Then, policy is enabled, but we must insert
+	//    an additional allow-all rule. We must do this, even if all traffic is allowed, because
+	//    rules may have additional effects such as enabling L7 proxy.
+	hasIngressDefaultDeny := false
+	hasEgressDefaultDeny := false
+	for _, r := range matchingRules {
+		if !ingress || !hasIngressDefaultDeny { // short-circuit len()
+			if len(r.Ingress) > 0 || len(r.IngressDeny) > 0 {
+				ingress = true
+				if *r.EnableDefaultDeny.Ingress {
+					hasIngressDefaultDeny = true
+				}
+			}
+		}
+
+		if !egress || !hasEgressDefaultDeny { // short-circuit len()
+			if len(r.Egress) > 0 || len(r.EgressDeny) > 0 {
+				egress = true
+				if *r.EnableDefaultDeny.Egress {
+					hasEgressDefaultDeny = true
+				}
+			}
+		}
+		if ingress && egress && hasIngressDefaultDeny && hasEgressDefaultDeny {
+			break
+		}
+	}
+
+	// If there only ingress default-allow rules, then insert a wildcard rule
+	if !hasIngressDefaultDeny && ingress {
+		log.WithField(logfields.Identity, securityIdentity).Info("Only default-allow policies, synthesizing ingress wildcard-allow rule")
+		matchingRules = append(matchingRules, wildcardRule(securityIdentity.LabelArray, true /*ingress*/))
+	}
+
+	// Same for egress -- synthesize a wildcard rule
+	if !hasEgressDefaultDeny && egress {
+		log.WithField(logfields.Identity, securityIdentity).Info("Only default-allow policies, synthesizing egress wildcard-allow rule")
+		matchingRules = append(matchingRules, wildcardRule(securityIdentity.LabelArray, false /*egress*/))
+	}
+
+	return
+}
+
+// wildcardRule generates a wildcard rule that only selects the given identity.
+func wildcardRule(lbls labels.LabelArray, ingress bool) *rule {
+	r := &rule{
+		metadata: newRuleMetadata(),
+	}
+
+	if ingress {
+		r.Ingress = []api.IngressRule{
+			{
+				IngressCommonRule: api.IngressCommonRule{
+					FromEntities: []api.Entity{api.EntityAll},
+				},
+			},
+		}
+	} else {
+		r.Egress = []api.EgressRule{
+			{
+				EgressCommonRule: api.EgressCommonRule{
+					ToEntities: []api.Entity{api.EntityAll},
+				},
+			},
+		}
+	}
+
+	es := api.NewESFromLabels(lbls...)
+	if lbls.Has(labels.IDNameHost) {
+		r.NodeSelector = es
+	} else {
+		r.EndpointSelector = es
+	}
+	_ = r.Sanitize()
+
+	return r
 }

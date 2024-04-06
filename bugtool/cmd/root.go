@@ -81,6 +81,8 @@ var (
 	parallelWorkers          int
 	ciliumAgentContainerName string
 	excludeObjectFiles       bool
+	hubbleMetrics            bool
+	hubbleMetricsPort        int
 )
 
 func init() {
@@ -93,7 +95,7 @@ func init() {
 		"pprof-port", option.PprofPortAgent,
 		fmt.Sprintf(
 			"Pprof port to connect to. Known Cilium component ports are agent:%d, operator:%d, apiserver:%d",
-			option.PprofPortAgent, operatorOption.PprofPortOperator, apiserverOption.PprofPortAPIServer,
+			option.PprofPortAgent, operatorOption.PprofPortOperator, apiserverOption.PprofPortClusterMesh,
 		),
 	)
 	BugtoolRootCmd.Flags().IntVar(&traceSeconds, "pprof-trace-seconds", 180, "Amount of seconds used for pprof CPU traces")
@@ -111,6 +113,8 @@ func init() {
 	BugtoolRootCmd.Flags().IntVar(&parallelWorkers, "parallel-workers", 0, "Maximum number of parallel worker tasks, use 0 for number of CPUs")
 	BugtoolRootCmd.Flags().StringVarP(&ciliumAgentContainerName, "cilium-agent-container-name", "", "cilium-agent", "Name of the Cilium Agent main container (when k8s-mode is true)")
 	BugtoolRootCmd.Flags().BoolVar(&excludeObjectFiles, "exclude-object-files", false, "Exclude per-endpoint object files. Template object files will be kept")
+	BugtoolRootCmd.Flags().BoolVar(&hubbleMetrics, "hubble-metrics", true, "When set, hubble prometheus metrics")
+	BugtoolRootCmd.Flags().IntVar(&hubbleMetricsPort, "hubble-metrics-port", 9965, "Port to query for hubble metrics")
 }
 
 func getVerifyCiliumPods() (k8sPods []string) {
@@ -218,6 +222,12 @@ func runTool() {
 		if envoyMetrics {
 			if err := dumpEnvoy(cmdDir, "http://admin/stats/prometheus", "envoy-metrics.txt"); err != nil {
 				fmt.Fprintf(os.Stderr, "Unable to retrieve envoy prometheus metrics: %s\n", err)
+			}
+		}
+
+		if hubbleMetrics {
+			if err := dumpHubbleMetrics(cmdDir); err != nil {
+				fmt.Fprintf(os.Stderr, "Unable to retrieve hubble prometheus metrics: %s\n", err)
 			}
 		}
 
@@ -330,7 +340,6 @@ func runAll(commands []string, cmdDir string, k8sPods []string) {
 			continue
 		}
 
-		cmd := cmd // https://golang.org/doc/faq#closures_and_goroutines
 		err := wp.Submit(cmd, func(_ context.Context) error {
 			if strings.Contains(cmd, "xfrm state") {
 				//  Output of 'ip -s xfrm state' needs additional processing to replace
@@ -452,7 +461,7 @@ func writeCmdToFile(cmdDir, prompt string, k8sPods []string, enableMarkdown bool
 			fmt.Fprint(f, string(output))
 		} else if enableMarkdown && len(output) > 0 {
 			// Write prompt as header and the output as body, and/or error but delete empty output.
-			fmt.Fprint(f, fmt.Sprintf("# %s\n\n```\n%s\n```\n", prompt, output))
+			fmt.Fprintf(f, "# %s\n\n```\n%s\n```\n", prompt, output)
 		}
 	}
 
@@ -496,6 +505,12 @@ func getCiliumPods(namespace, label string) ([]string, error) {
 	}
 
 	return ciliumPods, nil
+}
+
+func dumpHubbleMetrics(rootDir string) error {
+	httpClient := http.DefaultClient
+	url := fmt.Sprintf("http://localhost:%d/metrics", hubbleMetricsPort)
+	return downloadToFile(httpClient, url, filepath.Join(rootDir, "hubble-metrics.txt"))
 }
 
 func dumpEnvoy(rootDir string, resource string, fileName string) error {

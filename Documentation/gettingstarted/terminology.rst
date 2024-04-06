@@ -135,7 +135,7 @@ runtime.
 
     $ docker run --net cilium -d -l app=benchmark tgraf/netperf
     aaff7190f47d071325e7af06577f672beff64ccc91d2b53c42262635c063cf1c
-    $  cilium endpoint list
+    $ cilium-dbg endpoint list
     ENDPOINT   POLICY        IDENTITY   LABELS (source:key[=value])   IPv6                   IPv4            STATUS
                ENFORCEMENT
     62006      Disabled      257        container:app=benchmark       f00d::a00:20f:0:f236   10.15.116.202   ready
@@ -238,13 +238,6 @@ identities are prefixed with the string ``reserved:``.
 | ``reserved:ingress``        | 8          | Given to the IPs used as the source address for   |
 |                             |            | connections from Ingress proxies.                 |
 +-----------------------------+------------+---------------------------------------------------+
-
-.. note::
-
-   Cilium used to include both the local and all remote hosts in the
-   ``reserved:host`` identity. This is still the default option unless a recent
-   default ConfigMap is used. The remote-node identity can be enabled via
-   the option ``enable-remote-node-identity``.
 
 Well-known Identities
 ---------------------

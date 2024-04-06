@@ -5,13 +5,13 @@
   },
   "staticResources": {
     "listeners": [
-      {{- if and .Values.proxy.prometheus.enabled .Values.envoy.prometheus.enabled }}
+      {{- if .Values.envoy.prometheus.enabled }}
       {
         "name": "envoy-prometheus-metrics-listener",
         "address": {
           "socket_address": {
             "address": "0.0.0.0",
-            "port_value": {{ .Values.proxy.prometheus.port | default .Values.envoy.prometheus.port }}
+            "port_value": {{ .Values.envoy.prometheus.port }}
           }
         },
         "filter_chains": [
@@ -36,8 +36,75 @@
                               "prefix": "/metrics"
                             },
                             "route": {
-                              "cluster": "envoy-admin",
+                              "cluster": "/envoy-admin",
                               "prefix_rewrite": "/stats/prometheus"
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  "http_filters": [
+                    {
+                      "name": "envoy.filters.http.router",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                      }
+                    }
+                  ],
+                  "stream_idle_timeout": "0s"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {{- end }}
+      {{- if and .Values.envoy.debug.admin.enabled }}
+      {
+        "name": "envoy-admin-listener",
+        "address": {
+          "socket_address": {
+            "address": {{ .Values.ipv4.enabled | ternary "127.0.0.1" "::1" | quote }},
+            "port_value": {{ .Values.envoy.debug.admin.port }}
+          }
+        },
+        {{- if and .Values.ipv4.enabled .Values.ipv6.enabled }}
+        "additional_addresses": [
+          {
+            "address": {
+              "socket_address": {
+                "address": "::1",
+                "port_value": {{ .Values.envoy.debug.admin.port }}
+              }
+            }
+          }
+        ],
+        {{- end }}
+        "filter_chains": [
+          {
+            "filters": [
+              {
+                "name": "envoy.filters.network.http_connection_manager",
+                "typed_config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                  "stat_prefix": "envoy-admin-listener",
+                  "route_config": {
+                    "virtual_hosts": [
+                      {
+                        "name": "admin_route",
+                        "domains": [
+                          "*"
+                        ],
+                        "routes": [
+                          {
+                            "name": "admin_route",
+                            "match": {
+                              "prefix": "/"
+                            },
+                            "route": {
+                              "cluster": "/envoy-admin",
+                              "prefix_rewrite": "/"
                             }
                           }
                         ]
@@ -102,7 +169,7 @@
                               "prefix": "/healthz"
                             },
                             "route": {
-                              "cluster": "envoy-admin",
+                              "cluster": "/envoy-admin",
                               "prefix_rewrite": "/ready"
                             }
                           }
@@ -245,11 +312,11 @@
         }
       },
       {
-        "name": "envoy-admin",
+        "name": "/envoy-admin",
         "type": "STATIC",
         "connectTimeout": "{{ .Values.envoy.connectTimeoutSeconds }}s",
         "loadAssignment": {
-          "clusterName": "envoy-admin",
+          "clusterName": "/envoy-admin",
           "endpoints": [
             {
               "lbEndpoints": [
@@ -301,6 +368,14 @@
       "resourceApiVersion": "V3"
     }
   },
+  "bootstrapExtensions": [
+    {
+      "name": "envoy.bootstrap.internal_listener",
+      "typed_config": {
+        "@type": "type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener"
+      }
+    }
+  ],
   "layeredRuntime": {
     "layers": [
       {

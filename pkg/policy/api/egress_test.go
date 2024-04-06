@@ -10,6 +10,8 @@ import (
 
 	. "github.com/cilium/checkmate"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
+
 	"github.com/cilium/cilium/pkg/checker"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 )
@@ -21,7 +23,7 @@ func (s *PolicyAPITestSuite) TestRequiresDerivativeRuleWithoutToGroups(c *C) {
 
 func (s *PolicyAPITestSuite) TestRequiresDerivativeRuleWithToGroups(c *C) {
 	eg := EgressRule{}
-	eg.ToGroups = []ToGroups{
+	eg.ToGroups = []Groups{
 		GetToGroupsRule(),
 	}
 	c.Assert(eg.RequiresDerivative(), Equals, true)
@@ -46,14 +48,14 @@ func (s *PolicyAPITestSuite) TestCreateDerivativeRuleWithoutToGroups(c *C) {
 }
 
 func (s *PolicyAPITestSuite) TestCreateDerivativeRuleWithToGroupsWitInvalidRegisterCallback(c *C) {
-	cb := func(ctx context.Context, group *ToGroups) ([]netip.Addr, error) {
+	cb := func(ctx context.Context, group *Groups) ([]netip.Addr, error) {
 		return []netip.Addr{}, fmt.Errorf("Invalid error")
 	}
 	RegisterToGroupsProvider(AWSProvider, cb)
 
 	eg := &EgressRule{
 		EgressCommonRule: EgressCommonRule{
-			ToGroups: []ToGroups{
+			ToGroups: []Groups{
 				GetToGroupsRule(),
 			},
 		},
@@ -68,7 +70,7 @@ func (s *PolicyAPITestSuite) TestCreateDerivativeRuleWithToGroupsAndToPorts(c *C
 
 	eg := &EgressRule{
 		EgressCommonRule: EgressCommonRule{
-			ToGroups: []ToGroups{
+			ToGroups: []Groups{
 				GetToGroupsRule(),
 			},
 		},
@@ -91,7 +93,7 @@ func (s *PolicyAPITestSuite) TestCreateDerivativeWithoutErrorAndNoIPs(c *C) {
 
 	eg := &EgressRule{
 		EgressCommonRule: EgressCommonRule{
-			ToGroups: []ToGroups{
+			ToGroups: []Groups{
 				GetToGroupsRule(),
 			},
 		},
@@ -298,13 +300,14 @@ func (s *PolicyAPITestSuite) TestIsLabelBasedEgress(c *C) {
 		{
 			name: "rule-with-icmp",
 			setupArgs: func() args {
+				icmpType := intstr.FromInt(8)
 				return args{
 					&EgressRule{
 						ICMPs: ICMPRules{
 							{
 								Fields: []ICMPField{
 									{
-										Type: 8,
+										Type: &icmpType,
 									},
 								},
 							},
@@ -321,6 +324,7 @@ func (s *PolicyAPITestSuite) TestIsLabelBasedEgress(c *C) {
 		{
 			name: "rule-with-icmp6",
 			setupArgs: func() args {
+				icmpType := intstr.FromInt(128)
 				return args{
 					&EgressRule{
 						ICMPs: ICMPRules{
@@ -328,7 +332,7 @@ func (s *PolicyAPITestSuite) TestIsLabelBasedEgress(c *C) {
 								Fields: []ICMPField{
 									{
 										Family: IPv6Family,
-										Type:   128,
+										Type:   &icmpType,
 									},
 								},
 							},

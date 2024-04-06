@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"time"
 
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/prometheus/client_golang/prometheus"
@@ -29,6 +28,7 @@ import (
 	_ "github.com/cilium/cilium/pkg/hubble/metrics/port-distribution" // invoke init
 	_ "github.com/cilium/cilium/pkg/hubble/metrics/tcp"               // invoke init
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 type PodDeletionHandler struct {
@@ -53,6 +53,20 @@ var (
 	}, []string{labelSource})
 )
 
+// Metrics related to Hubble metrics HTTP requests handling
+var (
+	RequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: api.DefaultPrometheusNamespace,
+		Name:      "metrics_http_handler_requests_total",
+		Help:      "A counter for requests to Hubble metrics handler.",
+	}, []string{"code"})
+	RequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: api.DefaultPrometheusNamespace,
+		Name:      "metrics_http_handler_request_duration_seconds",
+		Help:      "A histogram of latencies of Hubble metrics handler.",
+	}, []string{"code"})
+)
+
 // ProcessFlow processes a flow and updates metrics
 func ProcessFlow(ctx context.Context, flow *pb.Flow) error {
 	if enabledMetrics != nil {
@@ -75,9 +89,12 @@ func initMetricHandlers(enabled api.Map) (*api.Handlers, error) {
 func initMetricsServer(address string, enableOpenMetrics bool, errChan chan error) {
 	go func() {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{
+		handler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
 			EnableOpenMetrics: enableOpenMetrics,
-		}))
+		})
+		handler = promhttp.InstrumentHandlerCounter(RequestsTotal, handler)
+		handler = promhttp.InstrumentHandlerDuration(RequestDuration, handler)
+		mux.Handle("/metrics", handler)
 		srv := http.Server{
 			Addr:    address,
 			Handler: mux,
@@ -100,6 +117,7 @@ func initPodDeletionHandler() {
 				return
 			}
 			enabledMetrics.ProcessPodDeletion(pod.(*slim_corev1.Pod))
+			podDeletionHandler.queue.Done(pod)
 		}
 	}()
 }
@@ -114,6 +132,8 @@ func initMetrics(address string, enabled api.Map, grpcMetrics *grpc_prometheus.S
 
 	registry.MustRegister(grpcMetrics)
 	registry.MustRegister(LostEvents)
+	registry.MustRegister(RequestsTotal)
+	registry.MustRegister(RequestDuration)
 
 	errChan := make(chan error, 1)
 
@@ -128,7 +148,7 @@ func initMetrics(address string, enabled api.Map, grpcMetrics *grpc_prometheus.S
 func EnableMetrics(log logrus.FieldLogger, metricsServer string, m []string, grpcMetrics *grpc_prometheus.ServerMetrics, enableOpenMetrics bool) error {
 	errChan, err := initMetrics(metricsServer, api.ParseMetricList(m), grpcMetrics, enableOpenMetrics)
 	if err != nil {
-		return fmt.Errorf("unable to setup metrics: %v", err)
+		return fmt.Errorf("unable to setup metrics: %w", err)
 	}
 	go func() {
 		err := <-errChan
@@ -137,4 +157,9 @@ func EnableMetrics(log logrus.FieldLogger, metricsServer string, m []string, grp
 		}
 	}()
 	return nil
+}
+
+// Register registers additional metrics collectors within hubble metrics registry.
+func Register(cs ...prometheus.Collector) {
+	registry.MustRegister(cs...)
 }

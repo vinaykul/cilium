@@ -9,6 +9,8 @@ import (
 	"github.com/cilium/cilium/pkg/maps/configmap"
 	"github.com/cilium/cilium/pkg/maps/ctmap/gc"
 	"github.com/cilium/cilium/pkg/maps/egressmap"
+	"github.com/cilium/cilium/pkg/maps/l2respondermap"
+	"github.com/cilium/cilium/pkg/maps/multicast"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
 	"github.com/cilium/cilium/pkg/maps/signalmap"
 )
@@ -36,4 +38,10 @@ var Cell = cell.Module(
 
 	// Provides the node map which contains information about node IDs and their IP addresses.
 	nodemap.Cell,
+
+	// Provides access to the L2 responder map.
+	l2respondermap.Cell,
+
+	// Provides access to the multicast maps.
+	multicast.Cell,
 )

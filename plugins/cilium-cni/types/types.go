@@ -6,7 +6,6 @@ package types
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 
 	cniTypes "github.com/containernetworking/cni/pkg/types"
@@ -22,16 +21,17 @@ import (
 // NetConf is the Cilium specific CNI network configuration
 type NetConf struct {
 	cniTypes.NetConf
-	MTU          int                    `json:"mtu"`
-	Args         Args                   `json:"args"`
-	ENI          eniTypes.ENISpec       `json:"eni,omitempty"`
-	Azure        azureTypes.AzureSpec   `json:"azure,omitempty"`
-	IPAM         IPAM                   `json:"ipam,omitempty"` // Shadows the JSON field "ipam" in cniTypes.NetConf.
-	AlibabaCloud alibabaCloudTypes.Spec `json:"alibaba-cloud,omitempty"`
-	EnableDebug  bool                   `json:"enable-debug"`
-	LogFormat    string                 `json:"log-format"`
-	LogFile      string                 `json:"log-file"`
-	ChainingMode string                 `json:"chaining-mode"`
+	MTU            int                    `json:"mtu"`
+	Args           Args                   `json:"args"`
+	EnableRouteMTU bool                   `json:"enable-route-mtu"`
+	ENI            eniTypes.ENISpec       `json:"eni,omitempty"`
+	Azure          azureTypes.AzureSpec   `json:"azure,omitempty"`
+	IPAM           IPAM                   `json:"ipam,omitempty"` // Shadows the JSON field "ipam" in cniTypes.NetConf.
+	AlibabaCloud   alibabaCloudTypes.Spec `json:"alibaba-cloud,omitempty"`
+	EnableDebug    bool                   `json:"enable-debug"`
+	LogFormat      string                 `json:"log-format"`
+	LogFile        string                 `json:"log-file"`
+	ChainingMode   string                 `json:"chaining-mode"`
 }
 
 // IPAM is the Cilium specific CNI IPAM configuration
@@ -49,15 +49,15 @@ func parsePrevResult(n *NetConf) (*NetConf, error) {
 	if n.RawPrevResult != nil {
 		resultBytes, err := json.Marshal(n.RawPrevResult)
 		if err != nil {
-			return nil, fmt.Errorf("could not serialize prevResult: %v", err)
+			return nil, fmt.Errorf("could not serialize prevResult: %w", err)
 		}
 		res, err := version.NewResult(n.CNIVersion, resultBytes)
 		if err != nil {
-			return nil, fmt.Errorf("could not parse prevResult: %v", err)
+			return nil, fmt.Errorf("could not parse prevResult: %w", err)
 		}
 		n.PrevResult, err = current.NewResultFromResult(res)
 		if err != nil {
-			return nil, fmt.Errorf("could not convert result to current version: %v", err)
+			return nil, fmt.Errorf("could not convert result to current version: %w", err)
 		}
 	}
 
@@ -69,7 +69,7 @@ func parsePrevResult(n *NetConf) (*NetConf, error) {
 func ReadNetConf(path string) (*NetConf, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("unable to read CNI configuration '%s': %s", path, err)
+		return nil, fmt.Errorf("unable to read CNI configuration '%s': %w", path, err)
 	}
 
 	netConfList := &NetConfList{}
@@ -89,7 +89,7 @@ func ReadNetConf(path string) (*NetConf, error) {
 func LoadNetConf(bytes []byte) (*NetConf, error) {
 	n := &NetConf{}
 	if err := json.Unmarshal(bytes, n); err != nil {
-		return nil, fmt.Errorf("failed to load netconf: %s", err)
+		return nil, fmt.Errorf("failed to load netconf: %w", err)
 	}
 
 	return parsePrevResult(n)
@@ -98,10 +98,8 @@ func LoadNetConf(bytes []byte) (*NetConf, error) {
 // ArgsSpec is the specification of additional arguments of the CNI ADD call
 type ArgsSpec struct {
 	cniTypes.CommonArgs
-	IP                         net.IP
-	K8S_POD_NAME               cniTypes.UnmarshallableString
-	K8S_POD_NAMESPACE          cniTypes.UnmarshallableString
-	K8S_POD_INFRA_CONTAINER_ID cniTypes.UnmarshallableString
+	K8S_POD_NAME      cniTypes.UnmarshallableString
+	K8S_POD_NAMESPACE cniTypes.UnmarshallableString
 }
 
 // Args contains arbitrary information a scheduler

@@ -22,11 +22,11 @@ import (
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/math"
 	"github.com/cilium/cilium/pkg/testutils"
+	testipam "github.com/cilium/cilium/pkg/testutils/ipam"
 )
 
 var (
-	k8sapi     = &k8sMock{}
-	metricsapi = metricsmock.NewMockMetrics()
+	k8sapi = &k8sMock{}
 )
 
 const testPoolID = ipamTypes.PoolID("global")
@@ -56,6 +56,10 @@ func (a *allocationImplementationMock) GetPoolQuota() ipamTypes.PoolQuotaMap {
 }
 
 func (a *allocationImplementationMock) Resync(ctx context.Context) time.Time {
+	return time.Now()
+}
+
+func (a *allocationImplementationMock) InstanceSync(ctx context.Context, instanceID string) time.Time {
 	return time.Now()
 }
 
@@ -104,16 +108,18 @@ func (n *nodeOperationsMock) PrepareIPAllocation(scopedLog *logrus.Entry) (*Allo
 	n.allocator.mutex.RLock()
 	defer n.allocator.mutex.RUnlock()
 	return &AllocationAction{
-		PoolID:                 testPoolID,
-		AvailableForAllocation: n.allocator.poolSize - n.allocator.allocatedIPs,
+		PoolID: testPoolID,
+		IPv4: IPAllocationAction{
+			AvailableForAllocation: n.allocator.poolSize - n.allocator.allocatedIPs,
+		},
 	}, nil
 }
 
 func (n *nodeOperationsMock) AllocateIPs(ctx context.Context, allocation *AllocationAction) error {
 	n.mutex.Lock()
 	n.allocator.mutex.Lock()
-	n.allocator.allocatedIPs += allocation.AvailableForAllocation
-	for i := 0; i < allocation.AvailableForAllocation; i++ {
+	n.allocator.allocatedIPs += allocation.IPv4.AvailableForAllocation
+	for i := 0; i < allocation.IPv4.AvailableForAllocation; i++ {
 		n.allocator.ipGenerator++
 		n.allocatedIPs = append(n.allocatedIPs, fmt.Sprintf("%d", n.allocator.ipGenerator))
 	}
@@ -153,7 +159,7 @@ func (n *nodeOperationsMock) releaseIP(ip string) error {
 func (n *nodeOperationsMock) ReleaseIPs(ctx context.Context, release *ReleaseAction) error {
 	for _, ipToDelete := range release.IPsToRelease {
 		if err := n.releaseIP(ipToDelete); err != nil {
-			return fmt.Errorf("unable to release IP %s: %s", ipToDelete, err)
+			return fmt.Errorf("unable to release IP %s: %w", ipToDelete, err)
 		}
 	}
 	return nil
@@ -174,18 +180,18 @@ func (n *nodeOperationsMock) IsPrefixDelegated() bool {
 func (e *IPAMSuite) TestGetNodeNames(c *check.C) {
 	am := newAllocationImplementationMock()
 	c.Assert(am, check.Not(check.IsNil))
-	mngr, err := NewNodeManager(am, k8sapi, metricsapi, 10, false, false)
+	mngr, err := NewNodeManager(am, k8sapi, metricsmock.NewMockMetrics(), 10, false, false)
 	c.Assert(err, check.IsNil)
 	c.Assert(mngr, check.Not(check.IsNil))
 
 	node1 := newCiliumNode("node1", 0, 0, 0)
-	mngr.Update(node1)
+	mngr.Upsert(node1)
 
 	names := mngr.GetNames()
 	c.Assert(len(names), check.Equals, 1)
 	c.Assert(names[0], check.Equals, "node1")
 
-	mngr.Update(newCiliumNode("node2", 0, 0, 0))
+	mngr.Upsert(newCiliumNode("node2", 0, 0, 0))
 
 	names = mngr.GetNames()
 	c.Assert(len(names), check.Equals, 2)
@@ -200,20 +206,48 @@ func (e *IPAMSuite) TestGetNodeNames(c *check.C) {
 func (e *IPAMSuite) TestNodeManagerGet(c *check.C) {
 	am := newAllocationImplementationMock()
 	c.Assert(am, check.Not(check.IsNil))
-	mngr, err := NewNodeManager(am, k8sapi, metricsapi, 10, false, false)
+	mngr, err := NewNodeManager(am, k8sapi, metricsmock.NewMockMetrics(), 10, false, false)
 	c.Assert(err, check.IsNil)
 	c.Assert(mngr, check.Not(check.IsNil))
 
-	// instances.Resync(context.TODO())
-
 	node1 := newCiliumNode("node1", 0, 0, 0)
-	mngr.Update(node1)
+	mngr.Upsert(node1)
 
 	c.Assert(mngr.Get("node1"), check.Not(check.IsNil))
 	c.Assert(mngr.Get("node2"), check.IsNil)
 
 	mngr.Delete(node1)
 	c.Assert(mngr.Get("node1"), check.IsNil)
+	c.Assert(mngr.Get("node2"), check.IsNil)
+}
+
+func (e *IPAMSuite) TestNodeManagerDelete(c *check.C) {
+	am := newAllocationImplementationMock()
+	c.Assert(am, check.Not(check.IsNil))
+	metrics := metricsmock.NewMockMetrics()
+	mngr, err := NewNodeManager(am, k8sapi, metrics, 10, false, false)
+	c.Assert(err, check.IsNil)
+	c.Assert(mngr, check.Not(check.IsNil))
+
+	node1 := newCiliumNode("node-foo", 0, 0, 0)
+	mngr.Upsert(node1)
+
+	c.Assert(mngr.Get("node-foo"), check.Not(check.IsNil))
+	c.Assert(mngr.Get("node2"), check.IsNil)
+
+	mngr.Resync(context.Background(), time.Now())
+	avail, used, needed := metrics.GetPerNodeMetrics("node-foo")
+	c.Assert(avail, check.Not(check.IsNil))
+	c.Assert(used, check.Not(check.IsNil))
+	c.Assert(needed, check.Not(check.IsNil))
+	mngr.Delete(node1)
+	// Following a node Delete, we expect the per-node metrics for that Node to be
+	// deleted.
+	avail, used, needed = metrics.GetPerNodeMetrics("node-foo")
+	c.Assert(avail, check.IsNil)
+	c.Assert(used, check.IsNil)
+	c.Assert(needed, check.IsNil)
+	c.Assert(mngr.Get("node-foo"), check.IsNil)
 	c.Assert(mngr.Get("node2"), check.IsNil)
 }
 
@@ -290,28 +324,28 @@ func reachedAddressesNeeded(mngr *NodeManager, nodeName string, needed int) (suc
 func (e *IPAMSuite) TestNodeManagerDefaultAllocation(c *check.C) {
 	am := newAllocationImplementationMock()
 	c.Assert(am, check.Not(check.IsNil))
-	mngr, err := NewNodeManager(am, k8sapi, metricsapi, 10, false, false)
+	mngr, err := NewNodeManager(am, k8sapi, metricsmock.NewMockMetrics(), 10, false, false)
 	c.Assert(err, check.IsNil)
 	c.Assert(mngr, check.Not(check.IsNil))
 
 	// Announce node wait for IPs to become available
 	cn := newCiliumNode("node1", 8, 0, 0)
-	mngr.Update(cn)
+	mngr.Upsert(cn)
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node1", 0) }, 5*time.Second), check.IsNil)
 
 	node := mngr.Get("node1")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 8)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 0)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 8)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 0)
 
 	// Use 7 out of 8 IPs
-	mngr.Update(updateCiliumNode(cn, 7))
+	mngr.Upsert(updateCiliumNode(cn, 7))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node1", 0) }, 5*time.Second), check.IsNil)
 
 	node = mngr.Get("node1")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 15)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 7)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 15)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 7)
 }
 
 // TestNodeManagerMinAllocate20 tests MinAllocate without PreAllocate
@@ -321,37 +355,37 @@ func (e *IPAMSuite) TestNodeManagerDefaultAllocation(c *check.C) {
 func (e *IPAMSuite) TestNodeManagerMinAllocate20(c *check.C) {
 	am := newAllocationImplementationMock()
 	c.Assert(am, check.Not(check.IsNil))
-	mngr, err := NewNodeManager(am, k8sapi, metricsapi, 10, false, false)
+	mngr, err := NewNodeManager(am, k8sapi, metricsmock.NewMockMetrics(), 10, false, false)
 	c.Assert(err, check.IsNil)
 	c.Assert(mngr, check.Not(check.IsNil))
 
 	// Announce node wait for IPs to become available
 	cn := newCiliumNode("node2", -1, 10, 0)
-	mngr.Update(cn)
+	mngr.Upsert(cn)
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node2", 0) }, 5*time.Second), check.IsNil)
 
 	node := mngr.Get("node2")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 10)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 0)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 10)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 0)
 
 	// 10 available, 8 used
-	mngr.Update(updateCiliumNode(cn, 8))
+	mngr.Upsert(updateCiliumNode(cn, 8))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node2", 0) }, 5*time.Second), check.IsNil)
 
 	node = mngr.Get("node2")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 10)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 8)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 10)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 8)
 
 	// Change MinAllocate to 20
-	mngr.Update(newCiliumNode("node2", 0, 20, 8))
+	mngr.Upsert(newCiliumNode("node2", 0, 20, 8))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node2", 0) }, 5*time.Second), check.IsNil)
 
 	node = mngr.Get("node2")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().UsedIPs, check.Equals, 8)
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 20)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 8)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 20)
 }
 
 // TestNodeManagerMinAllocateAndPreallocate tests MinAllocate in combination with PreAllocate
@@ -361,43 +395,43 @@ func (e *IPAMSuite) TestNodeManagerMinAllocate20(c *check.C) {
 func (e *IPAMSuite) TestNodeManagerMinAllocateAndPreallocate(c *check.C) {
 	am := newAllocationImplementationMock()
 	c.Assert(am, check.Not(check.IsNil))
-	mngr, err := NewNodeManager(am, k8sapi, metricsapi, 10, false, false)
+	mngr, err := NewNodeManager(am, k8sapi, metricsmock.NewMockMetrics(), 10, false, false)
 	c.Assert(err, check.IsNil)
 	c.Assert(mngr, check.Not(check.IsNil))
 
 	// Announce node, wait for IPs to become available
 	cn := newCiliumNode("node2", 1, 10, 0)
-	mngr.Update(cn)
+	mngr.Upsert(cn)
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node2", 0) }, 5*time.Second), check.IsNil)
 
 	node := mngr.Get("node2")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 10)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 0)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 10)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 0)
 
 	// Use 9 out of 10 IPs, no additional IPs should be allocated
-	mngr.Update(updateCiliumNode(cn, 9))
+	mngr.Upsert(updateCiliumNode(cn, 9))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node2", 0) }, 5*time.Second), check.IsNil)
 	node = mngr.Get("node2")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 10)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 9)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 10)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 9)
 
 	// Use 10 out of 10 IPs, PreAllocate 1 must kick in and allocate an additional IP
-	mngr.Update(updateCiliumNode(cn, 10))
+	mngr.Upsert(updateCiliumNode(cn, 10))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node2", 0) }, 5*time.Second), check.IsNil)
 	node = mngr.Get("node2")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 11)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 10)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 11)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 10)
 
 	// Release some IPs, no additional IPs should be allocated
-	mngr.Update(updateCiliumNode(cn, 8))
+	mngr.Upsert(updateCiliumNode(cn, 8))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node2", 0) }, 5*time.Second), check.IsNil)
 	node = mngr.Get("node2")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 11)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 8)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 11)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 8)
 }
 
 // TestNodeManagerReleaseAddress tests PreAllocate, MinAllocate and MaxAboveWatermark
@@ -410,68 +444,68 @@ func (e *IPAMSuite) TestNodeManagerReleaseAddress(c *check.C) {
 	operatorOption.Config.ExcessIPReleaseDelay = 2
 	am := newAllocationImplementationMock()
 	c.Assert(am, check.Not(check.IsNil))
-	mngr, err := NewNodeManager(am, k8sapi, metricsapi, 10, true, false)
+	mngr, err := NewNodeManager(am, k8sapi, metricsmock.NewMockMetrics(), 10, true, false)
 	c.Assert(err, check.IsNil)
 	c.Assert(mngr, check.Not(check.IsNil))
 
 	// Announce node, wait for IPs to become available
 	cn := newCiliumNode("node3", 4, 15, 0)
 	cn.Spec.IPAM.MaxAboveWatermark = 4
-	mngr.Update(cn)
+	mngr.Upsert(cn)
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node3", 0) }, 1*time.Second), check.IsNil)
 
 	node := mngr.Get("node3")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 19)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 0)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 19)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 0)
 
 	// Use 11 out of 19 IPs, no additional IPs should be allocated
-	mngr.Update(updateCiliumNode(cn, 11))
+	mngr.Upsert(updateCiliumNode(cn, 11))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node3", 0) }, 5*time.Second), check.IsNil)
 	node = mngr.Get("node3")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 19)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 11)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 19)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 11)
 
 	// Use 19 out of 19 IPs, PreAllocate 4 + MaxAboveWatermark must kick in and allocate 8 additional IPs
-	mngr.Update(updateCiliumNode(cn, 19))
+	mngr.Upsert(updateCiliumNode(cn, 19))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node3", 0) }, 5*time.Second), check.IsNil)
 	node = mngr.Get("node3")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 27)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 19)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 27)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 19)
 
 	// Free some IPs, 5 excess IPs appears but only be released at interval based resync, so expect timeout here
-	mngr.Update(updateCiliumNode(cn, 10))
+	mngr.Upsert(updateCiliumNode(cn, 10))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node3", 0) }, 2*time.Second), check.Not(check.IsNil))
 	node = mngr.Get("node3")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 27)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 10)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 27)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 10)
 
 	// Trigger resync manually, excess IPs should be released down to 18
 	// (10 used + 4 prealloc + 4 max-above-watermark)
 	// Excess timestamps should be registered after this trigger
-	mngr.resyncTrigger.Trigger()
+	node.instanceSync.Trigger()
 
 	// Acknowledge release IPs after 3 secs
 	time.AfterFunc(3*time.Second, func() {
 		// Excess delay duration should have elapsed by now, trigger resync again.
 		// IPs should be marked as excess
-		mngr.resyncTrigger.Trigger()
+		node.instanceSync.Trigger()
 		time.Sleep(1 * time.Second)
 		node.PopulateIPReleaseStatus(node.resource)
 		// Fake acknowledge IPs for release like agent would.
-		testutils.FakeAcknowledgeReleaseIps(node.resource)
+		testipam.FakeAcknowledgeReleaseIps(node.resource)
 		// Resync one more time to process acknowledgements.
-		mngr.resyncTrigger.Trigger()
+		node.instanceSync.Trigger()
 	})
 
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node3", 0) }, 5*time.Second), check.IsNil)
 	node = mngr.Get("node3")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 18)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 10)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 19)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 10)
 }
 
 // TestNodeManagerAbortRelease tests aborting IP release handshake if a new allocation on the node results in excess
@@ -481,37 +515,37 @@ func (e *IPAMSuite) TestNodeManagerAbortRelease(c *check.C) {
 	operatorOption.Config.ExcessIPReleaseDelay = 2
 	am := newAllocationImplementationMock()
 	c.Assert(am, check.Not(check.IsNil))
-	mngr, err := NewNodeManager(am, k8sapi, metricsapi, 10, true, false)
+	mngr, err := NewNodeManager(am, k8sapi, metricsmock.NewMockMetrics(), 10, true, false)
 	c.Assert(err, check.IsNil)
 	c.Assert(mngr, check.Not(check.IsNil))
 
 	// Announce node, wait for IPs to become available
 	cn := newCiliumNode("node3", 1, 3, 0)
-	mngr.Update(cn)
+	mngr.Upsert(cn)
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node3", 0) }, 1*time.Second), check.IsNil)
 
 	node := mngr.Get("node3")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 3)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 0)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 3)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 0)
 
 	// Use 3 out of 4 IPs, no additional IPs should be allocated
-	mngr.Update(updateCiliumNode(cn, 3))
+	mngr.Upsert(updateCiliumNode(cn, 3))
 	c.Assert(testutils.WaitUntil(func() bool { return reachedAddressesNeeded(mngr, "node3", 0) }, 5*time.Second), check.IsNil)
 	node = mngr.Get("node3")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 4)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 3)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 4)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 3)
 
-	mngr.Update(updateCiliumNode(node.resource, 2))
+	mngr.Upsert(updateCiliumNode(node.resource, 2))
 	node = mngr.Get("node3")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 4)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 2)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 4)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 2)
 
 	// Trigger resync manually, excess IPs should be released down to 3
 	// Excess timestamps should be registered after this trigger
-	mngr.resyncTrigger.Trigger()
+	node.instanceSync.Trigger()
 	wg.Add(1)
 
 	// Acknowledge release IPs after 3 secs
@@ -519,20 +553,20 @@ func (e *IPAMSuite) TestNodeManagerAbortRelease(c *check.C) {
 		defer wg.Done()
 		// Excess delay duration should have elapsed by now, trigger resync again.
 		// IPs should be marked as excess
-		mngr.resyncTrigger.Trigger()
+		node.instanceSync.Trigger()
 		time.Sleep(1 * time.Second)
 		node.PopulateIPReleaseStatus(node.resource)
 
 		c.Assert(len(node.resource.Status.IPAM.ReleaseIPs), check.Equals, 1)
 
 		// Fake acknowledge IPs for release like agent would.
-		testutils.FakeAcknowledgeReleaseIps(node.resource)
+		testipam.FakeAcknowledgeReleaseIps(node.resource)
 
 		// Use up one more IP to make excess = 0
-		mngr.Update(updateCiliumNode(node.resource, 3))
+		mngr.Upsert(updateCiliumNode(node.resource, 3))
 		node.poolMaintainer.Trigger()
 		// Resync one more time to process acknowledgements.
-		mngr.resyncTrigger.Trigger()
+		node.instanceSync.Trigger()
 
 		time.Sleep(1 * time.Second)
 		node.PopulateIPReleaseStatus(node.resource)
@@ -545,8 +579,8 @@ func (e *IPAMSuite) TestNodeManagerAbortRelease(c *check.C) {
 	wg.Wait()
 	node = mngr.Get("node3")
 	c.Assert(node, check.Not(check.IsNil))
-	c.Assert(node.Stats().AvailableIPs, check.Equals, 4)
-	c.Assert(node.Stats().UsedIPs, check.Equals, 3)
+	c.Assert(node.Stats().IPv4.AvailableIPs, check.Equals, 4)
+	c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 3)
 }
 
 type nodeState struct {
@@ -567,6 +601,7 @@ func (e *IPAMSuite) TestNodeManagerManyNodes(c *check.C) {
 
 	am := newAllocationImplementationMock()
 	c.Assert(am, check.Not(check.IsNil))
+	metricsapi := metricsmock.NewMockMetrics()
 	mngr, err := NewNodeManager(am, k8sapi, metricsapi, 10, false, false)
 	c.Assert(err, check.IsNil)
 	c.Assert(mngr, check.Not(check.IsNil))
@@ -577,7 +612,7 @@ func (e *IPAMSuite) TestNodeManagerManyNodes(c *check.C) {
 		s := &nodeState{name: fmt.Sprintf("node%d", i), instanceName: fmt.Sprintf("i-testNodeManagerManyNodes-%d", i)}
 		s.cn = newCiliumNode(s.name, 1, minAllocate, 0)
 		state[i] = s
-		mngr.Update(s.cn)
+		mngr.Upsert(s.cn)
 	}
 
 	for _, s := range state {
@@ -585,11 +620,11 @@ func (e *IPAMSuite) TestNodeManagerManyNodes(c *check.C) {
 
 		node := mngr.Get(s.name)
 		c.Assert(node, check.Not(check.IsNil))
-		if node.Stats().AvailableIPs != minAllocate {
-			c.Errorf("Node %s allocation mismatch. expected: %d allocated: %d", s.name, minAllocate, node.Stats().AvailableIPs)
+		if node.Stats().IPv4.AvailableIPs != minAllocate {
+			c.Errorf("Node %s allocation mismatch. expected: %d allocated: %d", s.name, minAllocate, node.Stats().IPv4.AvailableIPs)
 			c.Fail()
 		}
-		c.Assert(node.Stats().UsedIPs, check.Equals, 0)
+		c.Assert(node.Stats().IPv4.UsedIPs, check.Equals, 0)
 	}
 
 	// The above check returns as soon as the address requirements are met.
@@ -611,7 +646,7 @@ func (e *IPAMSuite) TestNodeManagerManyNodes(c *check.C) {
 func benchmarkAllocWorker(c *check.C, workers int64, delay time.Duration, rateLimit float64, burst int) {
 	am := newAllocationImplementationMock()
 	c.Assert(am, check.Not(check.IsNil))
-	mngr, err := NewNodeManager(am, k8sapi, metricsapi, 10, false, false)
+	mngr, err := NewNodeManager(am, k8sapi, metricsmock.NewMockMetrics(), 10, false, false)
 	c.Assert(err, check.IsNil)
 	c.Assert(mngr, check.Not(check.IsNil))
 
@@ -622,7 +657,7 @@ func benchmarkAllocWorker(c *check.C, workers int64, delay time.Duration, rateLi
 		s := &nodeState{name: fmt.Sprintf("node%d", i), instanceName: fmt.Sprintf("i-benchmarkAllocWorker-%d", i)}
 		s.cn = newCiliumNode(s.name, 1, 10, 0)
 		state[i] = s
-		mngr.Update(s.cn)
+		mngr.Upsert(s.cn)
 	}
 
 restart:

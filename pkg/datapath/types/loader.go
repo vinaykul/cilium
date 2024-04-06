@@ -9,6 +9,7 @@ import (
 	"net"
 
 	"github.com/cilium/cilium/pkg/datapath/loader/metrics"
+	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/lock"
 )
 
@@ -19,9 +20,13 @@ type Loader interface {
 	CompileAndLoad(ctx context.Context, ep Endpoint, stats *metrics.SpanStat) error
 	CompileOrLoad(ctx context.Context, ep Endpoint, stats *metrics.SpanStat) error
 	ReloadDatapath(ctx context.Context, ep Endpoint, stats *metrics.SpanStat) error
+	ReinitializeXDP(ctx context.Context, o BaseProgramOwner, extraCArgs []string) error
 	EndpointHash(cfg EndpointConfiguration) (string, error)
 	Unload(ep Endpoint)
-	Reinitialize(ctx context.Context, o BaseProgramOwner, deviceMTU int, iptMgr IptablesManager, p Proxy) error
+	Reinitialize(ctx context.Context, o BaseProgramOwner, tunnelConfig tunnel.Config, deviceMTU int, iptMgr IptablesManager, p Proxy) error
+	HostDatapathInitialized() <-chan struct{}
+	RestoreTemplates(stateDir string) error
+	DeviceHasTCProgramLoaded(hostInterface string, checkEgress bool) (bool, error)
 }
 
 // BaseProgramOwner is any type for which a loader is building base programs.
@@ -44,14 +49,15 @@ type PreFilter interface {
 // Proxy is any type which installs rules related to redirecting traffic to
 // a proxy.
 type Proxy interface {
-	ReinstallRules(ctx context.Context) error
+	ReinstallRoutingRules() error
+	ReinstallIPTablesRules(ctx context.Context) error
 }
 
 // IptablesManager manages iptables rules.
 type IptablesManager interface {
 	// InstallProxyRules creates the necessary datapath config (e.g., iptables
 	// rules for redirecting host proxy traffic on a specific ProxyPort)
-	InstallProxyRules(ctx context.Context, proxyPort uint16, ingress, localOnly bool, name string) error
+	InstallProxyRules(ctx context.Context, proxyPort uint16, localOnly bool, name string) error
 
 	// SupportsOriginalSourceAddr tells if the datapath supports
 	// use of original source addresses in proxy upstream

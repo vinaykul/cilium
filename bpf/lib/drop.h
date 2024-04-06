@@ -99,19 +99,13 @@ _send_drop_notify(__u8 file, __u16 line, struct __ctx_buff *ctx,
 		  __u32 src, __u32 dst, __u32 dst_id,
 		  __u32 reason, __u32 exitcode, enum metric_dir direction)
 {
+	int ret __maybe_unused;
+
 	/* These fields should be constants and fit (together) in 32 bits */
 	if (!__builtin_constant_p(exitcode) || exitcode > 0xff ||
 	    !__builtin_constant_p(file) || file > 0xff ||
 	    !__builtin_constant_p(line) || line > 0xffff)
 		__throw_build_bug();
-
-/* Clang 14 or higher fails for constant check, so skip it right now.
- * Enable again once we have more understanding why.
- */
-#if __clang_major__ < 14
-	if (!__builtin_constant_p(dst_id))
-		__throw_build_bug();
-#endif
 
 	/* Non-zero 'dst_id' is only to be used for ingress. */
 	if (dst_id != 0 && (!__builtin_constant_p(direction) || direction != METRIC_INGRESS))
@@ -123,8 +117,9 @@ _send_drop_notify(__u8 file, __u16 line, struct __ctx_buff *ctx,
 	ctx_store_meta(ctx, 3, dst_id);
 	ctx_store_meta(ctx, 4, exitcode | file << 8 | line << 16);
 
-	update_metrics(ctx_full_len(ctx), direction, (__u8)reason);
-	ep_tail_call(ctx, CILIUM_CALL_DROP_NOTIFY);
+	_update_metrics(ctx_full_len(ctx), direction, (__u8)reason, line, file);
+	ret = tail_call_internal(ctx, CILIUM_CALL_DROP_NOTIFY, NULL);
+	/* ignore the returned error, use caller-provided exitcode */
 
 	return exitcode;
 }
@@ -135,7 +130,7 @@ int _send_drop_notify(__u8 file __maybe_unused, __u16 line __maybe_unused,
 		      __u32 dst __maybe_unused, __u32 dst_id __maybe_unused,
 		      __u32 reason, __u32 exitcode, enum metric_dir direction)
 {
-	update_metrics(ctx_full_len(ctx), direction, (__u8)reason);
+	_update_metrics(ctx_full_len(ctx), direction, (__u8)reason, line, file);
 	return exitcode;
 }
 #endif /* DROP_NOTIFY */
@@ -168,24 +163,20 @@ int _send_drop_notify(__u8 file __maybe_unused, __u16 line __maybe_unused,
 	__DROP_REASON(err) | ((__u8)(__ext_err < -128 ? 0 : __ext_err) << 8); \
 })
 
-#include "../source_names_to_ids.h"
-
-#define __MAGIC_FILE__ (__u8)__source_file_name_to_id(__FILE_NAME__)
-
 #define send_drop_notify(ctx, src, dst, dst_id, reason, exitcode, direction) \
-	_send_drop_notify(__MAGIC_FILE__, __LINE__, ctx, src, dst, dst_id, \
+	_send_drop_notify(__MAGIC_FILE__, __MAGIC_LINE__, ctx, src, dst, dst_id, \
 			  __DROP_REASON(reason), exitcode, direction)
 
 #define send_drop_notify_error(ctx, src, reason, exitcode, direction) \
-	_send_drop_notify(__MAGIC_FILE__, __LINE__, ctx, src, 0, 0, \
+	_send_drop_notify(__MAGIC_FILE__, __MAGIC_LINE__, ctx, src, 0, 0, \
 			  __DROP_REASON(reason), exitcode, direction)
 
 #define send_drop_notify_ext(ctx, src, dst, dst_id, reason, ext_err, exitcode, direction) \
-	_send_drop_notify(__MAGIC_FILE__, __LINE__, ctx, src, dst, dst_id, \
+	_send_drop_notify(__MAGIC_FILE__, __MAGIC_LINE__, ctx, src, dst, dst_id, \
 			  __DROP_REASON_EXT(reason, ext_err), exitcode, direction)
 
 #define send_drop_notify_error_ext(ctx, src, reason, ext_err, exitcode, direction) \
-	_send_drop_notify(__MAGIC_FILE__, __LINE__, ctx, src, 0, 0, \
+	_send_drop_notify(__MAGIC_FILE__, __MAGIC_LINE__, ctx, src, 0, 0, \
 			  __DROP_REASON_EXT(reason, ext_err), exitcode, direction)
 
 #endif /* __LIB_DROP__ */

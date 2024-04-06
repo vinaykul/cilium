@@ -25,7 +25,7 @@ func fakeCheck(ep *endpoint.Endpoint) error {
 
 func (s *EndpointManagerSuite) TestmarkAndSweep(c *C) {
 	// Open-code WithPeriodicGC() to avoid running the controller
-	mgr := New(&dummyEpSyncher{})
+	mgr := New(&dummyEpSyncher{}, nil, nil)
 	mgr.checkHealth = fakeCheck
 	mgr.deleteEndpoint = endpointDeleteFunc(mgr.waitEndpointRemoved)
 
@@ -37,8 +37,9 @@ func (s *EndpointManagerSuite) TestmarkAndSweep(c *C) {
 	healthyEndpointIDs := []uint16{1, 3, 5, 7}
 	allEndpointIDs := append(healthyEndpointIDs, endpointIDToDelete)
 	for _, id := range allEndpointIDs {
-		ep := endpoint.NewEndpointWithState(s, s, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), id, endpoint.StateReady)
-		mgr.expose(ep)
+		ep := endpoint.NewTestEndpointWithState(c, s, s, testipcache.NewMockIPCache(), &endpoint.FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), id, endpoint.StateReady)
+		err := mgr.expose(ep)
+		c.Assert(err, IsNil)
 	}
 	c.Assert(len(mgr.GetEndpoints()), Equals, len(allEndpointIDs))
 

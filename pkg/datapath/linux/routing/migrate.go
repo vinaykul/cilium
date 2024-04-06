@@ -234,7 +234,7 @@ func (m *migrator) MigrateENIDatapath(compat bool) (int, int) {
 			scopedLog := log.WithField("rule", rule)
 			scopedLog.WithError(err).WithField("routes", routes).
 				Warnf("Failed to cleanup after successfully migrating endpoint to %s ENI datapath. "+
-					"It is recommended that theses routes are cleaned up (by running `ip route del`), as it is possible in the future "+
+					"It is recommended that these routes are cleaned up (by running `ip route del`), as it is possible in the future "+
 					"to collide with another endpoint with the same IP.", version)
 		}
 	}
@@ -488,14 +488,13 @@ func (m *migrator) copyRoutes(routes []netlink.Route, from, to int) (revert.Reve
 	// gateway." with an errno of ENETUNREACH.
 	for _, r := range routes {
 		if r.Scope == netlink.SCOPE_LINK {
-			route := r
-			route.Table = to
-			if err := m.rpdb.RouteReplace(&route); err != nil {
+			r.Table = to
+			if err := m.rpdb.RouteReplace(&r); err != nil {
 				return revertStack, fmt.Errorf("unable to replace link scoped route under table ID: %w", err)
 			}
 
 			revertStack.Push(func() error {
-				if err := m.rpdb.RouteDel(&route); err != nil {
+				if err := m.rpdb.RouteDel(&r); err != nil {
 					return fmt.Errorf("failed to revert route upsert: %w", err)
 				}
 				return nil
@@ -509,14 +508,13 @@ func (m *migrator) copyRoutes(routes []netlink.Route, from, to int) (revert.Reve
 			continue
 		}
 
-		route := r
-		route.Table = to
-		if err := m.rpdb.RouteReplace(&route); err != nil {
+		r.Table = to
+		if err := m.rpdb.RouteReplace(&r); err != nil {
 			return revertStack, fmt.Errorf("unable to replace route under table ID: %w", err)
 		}
 
 		revertStack.Push(func() error {
-			if err := m.rpdb.RouteDel(&route); err != nil {
+			if err := m.rpdb.RouteDel(&r); err != nil {
 				return fmt.Errorf("failed to revert route upsert: %w", err)
 			}
 			return nil

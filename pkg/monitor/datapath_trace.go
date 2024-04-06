@@ -5,8 +5,6 @@ package monitor
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -43,6 +41,8 @@ const (
 )
 
 // TraceNotifyV0 is the common message format for versions 0 and 1.
+// This struct needs to be kept in sync with the decodeTraceNotifyVersion0
+// func.
 type TraceNotifyV0 struct {
 	Type     uint8
 	ObsPoint uint8
@@ -60,11 +60,54 @@ type TraceNotifyV0 struct {
 	// data
 }
 
-// TraceNotifyV1 is the version 1 message format.
+// decodeTraceNotifyVersion0 decodes the trace notify message in 'data' into
+// the struct. This function needs to be kept in sync with the TraceNotifyV0
+// struct.
+func (tn *TraceNotifyV0) decodeTraceNotifyVersion0(data []byte) error {
+	// This eliminates the bounds check in the accesses to `data` below.
+	if l := len(data); l < traceNotifyV0Len {
+		return fmt.Errorf("unexpected TraceNotifyV0 data length, expected %d but got %d", traceNotifyV0Len, l)
+	}
+
+	tn.Type = data[0]
+	tn.ObsPoint = data[1]
+	tn.Source = byteorder.Native.Uint16(data[2:4])
+	tn.Hash = byteorder.Native.Uint32(data[4:8])
+	tn.OrigLen = byteorder.Native.Uint32(data[8:12])
+	tn.CapLen = byteorder.Native.Uint16(data[12:14])
+	tn.Version = byteorder.Native.Uint16(data[14:16])
+	tn.SrcLabel = identity.NumericIdentity(byteorder.Native.Uint32(data[16:20]))
+	tn.DstLabel = identity.NumericIdentity(byteorder.Native.Uint32(data[20:24]))
+	tn.DstID = byteorder.Native.Uint16(data[24:26])
+	tn.Reason = data[26]
+	tn.Flags = data[27]
+	tn.Ifindex = byteorder.Native.Uint32(data[28:32])
+
+	return nil
+}
+
+// TraceNotifyV1 is the version 1 message format. This struct needs to be kept
+// in sync with the decodeTraceNotifyVersion1 func.
 type TraceNotifyV1 struct {
 	TraceNotifyV0
 	OrigIP types.IPv6
 	// data
+}
+
+// decodeTraceNotifyVersion1 decodes the trace notify message in 'data' into
+// the struct. This function needs to be kept in sync with the TraceNotifyV1
+// struct.
+func (tn *TraceNotifyV1) decodeTraceNotifyVersion1(data []byte) error {
+	if l := len(data); l < traceNotifyV1Len {
+		return fmt.Errorf("unexpected TraceNotifyV1 data length, expected %d but got %d", traceNotifyV1Len, l)
+	}
+
+	if err := tn.decodeTraceNotifyVersion0(data); err != nil {
+		return err
+	}
+
+	copy(tn.OrigIP[:], data[32:48])
+	return nil
 }
 
 // TraceNotify is the message format of a trace notification in the BPF ring buffer
@@ -85,15 +128,21 @@ const (
 	TraceReasonCtRelated
 	TraceReasonCtReopened
 	TraceReasonUnknown
+	TraceReasonSRv6Encap
+	TraceReasonSRv6Decap
+	TraceReasonEncryptOverlay
 )
 
 var traceReasons = map[uint8]string{
-	TraceReasonPolicy:        "new",
-	TraceReasonCtEstablished: "established",
-	TraceReasonCtReply:       "reply",
-	TraceReasonCtRelated:     "related",
-	TraceReasonCtReopened:    "reopened",
-	TraceReasonUnknown:       "unknown",
+	TraceReasonPolicy:         "new",
+	TraceReasonCtEstablished:  "established",
+	TraceReasonCtReply:        "reply",
+	TraceReasonCtRelated:      "related",
+	TraceReasonCtReopened:     "reopened",
+	TraceReasonUnknown:        "unknown",
+	TraceReasonSRv6Encap:      "srv6-encap",
+	TraceReasonSRv6Decap:      "srv6-decap",
+	TraceReasonEncryptOverlay: "encrypt-overlay",
 }
 
 func connState(reason uint8) string {
@@ -105,11 +154,29 @@ func connState(reason uint8) string {
 }
 
 func TraceReasonIsKnown(reason uint8) bool {
-	switch reason {
+	switch reason & ^TraceReasonEncryptMask {
 	case TraceReasonUnknown:
 		return false
 	default:
 		return true
+	}
+}
+
+func TraceReasonIsEncap(reason uint8) bool {
+	switch reason & ^TraceReasonEncryptMask {
+	case TraceReasonSRv6Encap, TraceReasonEncryptOverlay:
+		return true
+	default:
+		return false
+	}
+}
+
+func TraceReasonIsDecap(reason uint8) bool {
+	switch reason & ^TraceReasonEncryptMask {
+	case TraceReasonSRv6Decap:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -125,9 +192,9 @@ func DecodeTraceNotify(data []byte, tn *TraceNotify) error {
 
 	switch version {
 	case TraceNotifyVersion0:
-		return binary.Read(bytes.NewReader(data), byteorder.Native, &tn.TraceNotifyV0)
+		return tn.decodeTraceNotifyVersion0(data)
 	case TraceNotifyVersion1:
-		return binary.Read(bytes.NewReader(data), byteorder.Native, tn)
+		return ((*TraceNotifyV1)(tn)).decodeTraceNotifyVersion1(data)
 	}
 	return fmt.Errorf("Unrecognized trace event (version %d)", version)
 }

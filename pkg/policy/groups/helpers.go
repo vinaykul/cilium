@@ -22,9 +22,7 @@ const (
 )
 
 func getDerivativeName(obj v1.Object) string {
-	return fmt.Sprintf("%s-togroups-%s",
-		obj.GetName(),
-		obj.GetUID())
+	return obj.GetName() + "-groups-" + string(obj.GetUID())
 }
 
 // createDerivativeCNP will return a new CNP based on the given rule.
@@ -59,7 +57,7 @@ func createDerivativeCNP(ctx context.Context, cnp *cilium_v2.CiliumNetworkPolicy
 		// We return a valid pointer for derivative policy here instead of nil.
 		// This object is used to get generated name for the derivative policy
 		// when updating the status of the network policy.
-		return derivativeCNP, fmt.Errorf("cannot parse CNP: %v", err)
+		return derivativeCNP, fmt.Errorf("cannot parse CNP: %w", err)
 	}
 
 	derivativeCNP.Specs, err = createAPIRules(ctx, rules)
@@ -107,7 +105,7 @@ func createDerivativeCCNP(ctx context.Context, cnp *cilium_v2.CiliumNetworkPolic
 		// We return a valid pointer for derivative policy here instead of nil.
 		// This object is used to get generated name for the derivative policy
 		// when updating the status of the network policy.
-		return derivativeCCNP, fmt.Errorf("cannot parse CCNP: %v", err)
+		return derivativeCCNP, fmt.Errorf("cannot parse CCNP: %w", err)
 	}
 
 	derivativeCCNP.Specs, err = createAPIRules(ctx, rules)
@@ -200,7 +198,7 @@ func updateDerivativeCNPStatus(clientset client.Clientset, cnp *cilium_v2.Cilium
 		Get(context.TODO(), cnp.ObjectMeta.Name, v1.GetOptions{})
 
 	if clientErr != nil {
-		return fmt.Errorf("cannot get Kubernetes policy: %v", clientErr)
+		return fmt.Errorf("cannot get Kubernetes policy: %w", clientErr)
 	}
 
 	if k8sCNP.ObjectMeta.UID != cnp.ObjectMeta.UID {
@@ -208,7 +206,7 @@ func updateDerivativeCNPStatus(clientset client.Clientset, cnp *cilium_v2.Cilium
 		// that the new policy is not in the cache to not loop over it. The
 		// kubernetes watcher should take care about that.
 		groupsCNPCache.DeleteCNP(k8sCNP)
-		return fmt.Errorf("policy UID mistmatch")
+		return fmt.Errorf("policy UID mismatch")
 	}
 
 	k8sCNP.SetDerivedPolicyStatus(derivativeName, status)
@@ -227,7 +225,7 @@ func updateDerivativeCCNPStatus(clientset client.Clientset, cnp *cilium_v2.Ciliu
 		Get(context.TODO(), cnp.ObjectMeta.Name, v1.GetOptions{})
 
 	if clientErr != nil {
-		return fmt.Errorf("cannot get Kubernetes policy: %v", clientErr)
+		return fmt.Errorf("cannot get Kubernetes policy: %w", clientErr)
 	}
 
 	if k8sCCNP.ObjectMeta.UID != cnp.ObjectMeta.UID {
@@ -237,7 +235,7 @@ func updateDerivativeCCNPStatus(clientset client.Clientset, cnp *cilium_v2.Ciliu
 		groupsCNPCache.DeleteCNP(&cilium_v2.CiliumNetworkPolicy{
 			ObjectMeta: k8sCCNP.ObjectMeta,
 		})
-		return fmt.Errorf("policy UID mistmatch")
+		return fmt.Errorf("policy UID mismatch")
 	}
 
 	k8sCCNP.SetDerivedPolicyStatus(derivativeName, status)

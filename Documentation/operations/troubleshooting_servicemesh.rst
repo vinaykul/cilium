@@ -20,15 +20,18 @@ Generic
 Manual Verification of Setup
 ----------------------------
 
- #. Validate that the ``kubeProxyReplacement`` is set to either partial or strict.
+ #. Validate that ``nodePort.enabled`` is true.
 
     .. code-block:: shell-session
 
-        $ kubectl exec -n kube-system ds/cilium -- cilium status
+        $ kubectl exec -n kube-system ds/cilium -- cilium-dbg status --verbose
         ...
-        KVStore:                 Ok   Disabled
-        Kubernetes:              Ok   1.23 (v1.23.6) [linux/amd64]
-        KubeProxyReplacement:    Strict   [eth0 192.168.49.2]
+        KubeProxyReplacement Details:
+        ...
+          Services:
+          - ClusterIP:      Enabled
+          - NodePort:       Enabled (Range: 30000-32767)
+        ...
 
  #. Validate that runtime the values of ``enable-envoy-config`` and ``enable-ingress-controller``
     are true. Ingress controller flag is optional if customer only uses ``CiliumEnvoyConfig`` or
@@ -101,8 +104,7 @@ note that any change of Cilium flags requires a restart of the Cilium agent and 
 
 .. note::
 
-    The Ingress traffic is always allowed to pass through Cilium, regardless of the related
-    CiliumNetworkPolicy for underlying pods or endpoints.
+    The originating source IP is used for enforcing ingress traffic.
 
 The request normally traverses from LoadBalancer service to pre-assigned port of your
 node, then gets forwarded to the Cilium Envoy proxy, and finally gets proxied to the actual
@@ -182,7 +184,7 @@ backend service.
 
     .. code-block:: shell-session
 
-        $ kubectl exec -n kube-system ds/cilium -- cilium status
+        $ kubectl exec -n kube-system ds/cilium -- cilium-dbg status
         ...
         Controller Status:       49/49 healthy
         Proxy Status:            OK, ip 10.0.0.25, 6 redirects active on ports 10000-20000
@@ -271,8 +273,8 @@ backend service.
         Jul  7 13:08:16.757: 10.0.0.95:42509 <- default/details-v1-5498c86cf5-cnt9q:9080 to-stack FORWARDED (TCP Flags: ACK, FIN)
         Jul  7 13:08:16.757: 10.0.0.95:42509 -> default/details-v1-5498c86cf5-cnt9q:9080 to-endpoint FORWARDED (TCP Flags: ACK, FIN)
 
-        # Sample output of cilium monitor
-        $ ksysex ds/cilium -- cilium monitor
+        # Sample output of cilium-dbg monitor
+        $ ksysex ds/cilium -- cilium-dbg monitor
         level=info msg="Initializing dissection cache..." subsys=monitor
         -> endpoint 212 flow 0x3000e251 , identity ingress->61131 state new ifindex lxcfc90a8580fd6 orig-ip 10.0.0.192: 10.0.0.192:34219 -> 10.0.0.164:9080 tcp SYN
         -> stack flow 0x2481d648 , identity 61131->ingress state reply ifindex 0 orig-ip 0.0.0.0: 10.0.0.164:9080 -> 10.0.0.192:34219 tcp SYN, ACK

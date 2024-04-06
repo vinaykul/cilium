@@ -4,13 +4,16 @@
 package node
 
 import (
+	"context"
+	"io"
 	"sync"
 
-	"github.com/cilium/cilium/pkg/hive"
+	"github.com/cilium/stream"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+
 	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/node/types"
-	"github.com/cilium/cilium/pkg/stream"
 )
 
 type LocalNode struct {
@@ -18,95 +21,141 @@ type LocalNode struct {
 	// OptOutNodeEncryption will make the local node opt-out of node-to-node
 	// encryption
 	OptOutNodeEncryption bool
+	// Unique identifier of the Kubernetes node, used to construct the
+	// corresponding owner reference.
+	UID k8stypes.UID
+	// ID of the node assigned by the cloud provider.
+	ProviderID string
 }
 
-// LocalNodeInitializer specifies how to build the initial local node object.
-type LocalNodeInitializer interface {
-	InitLocalNode(*LocalNode) error
-}
-
-// LocalNodeStore is the canonical owner for the local node object and provides
-// a reactive API for observing and updating the state.
-type LocalNodeStore interface {
-	// Changes to the local node are observable via Observe()
-	stream.Observable[LocalNode]
-
-	// Update modifies the local node with a mutator. The updated value
-	// is passed to observers.
-	Update(func(*LocalNode))
-
-	// Get retrieves the current local node. Use Get() only for inspecting the state,
-	// e.g. in API handlers. Do not assume the value does not change over time.
-	// Blocks until the store has been initialized.
-	Get() LocalNode
+// LocalNodeSynchronizer specifies how to build, and keep synchronized the local
+// node object.
+type LocalNodeSynchronizer interface {
+	InitLocalNode(context.Context, *LocalNode) error
+	SyncLocalNode(context.Context, *LocalNodeStore)
 }
 
 // LocalNodeStoreCell provides the LocalNodeStore instance.
 // The LocalNodeStore is the canonical owner of `types.Node` for the local node and
 // provides a reactive API for observing and updating it.
-//
-// This currently returns the singleton instance instead of constructing a fresh
-// one with newLocalNodeStore() in order to keep the semantics of the global getters/setters
-// as is.
-var LocalNodeStoreCell = cell.Provide(
-	func() LocalNodeStore { return localNode },
+var LocalNodeStoreCell = cell.Module(
+	"local-node-store",
+	"Provides LocalNodeStore for observing and updating local node info",
+
+	cell.Provide(NewLocalNodeStore),
 )
 
 // LocalNodeStoreParams are the inputs needed for constructing LocalNodeStore.
 type LocalNodeStoreParams struct {
 	cell.In
 
-	Lifecycle hive.Lifecycle
-	Init      LocalNodeInitializer `optional:"true"`
+	Lifecycle cell.Lifecycle
+	Sync      LocalNodeSynchronizer `optional:"true"`
 }
 
-// localNodeStore implements the LocalNodeStore using a simple in-memory
-// backing. Reflecting the new state to persistent stores, e.g. kvstore or k8s
-// is left to observers.
-type localNodeStore struct {
+// LocalNodeStore is the canonical owner for the local node object and provides
+// a reactive API for observing and updating the state.
+type LocalNodeStore struct {
+	// Changes to the local node are observable.
 	stream.Observable[LocalNode]
 
-	mu   lock.Mutex
-	cond *sync.Cond
+	// mu is the main LocalNodeStore mutex, which protects the access to the
+	// different fields during all operations. getMu, instead, is a separate
+	// mutex which is used to guard updates of the value field, as well as its
+	// access by the Get() method. The reason for using two separate mutexes
+	// being that we don't want Get() to be blocked while calling emit, as
+	// that synchronously calls into all subscribers, which is a potentially
+	// expensive operation, and a possible source of deadlocks (e.g., one of
+	// the subscribers needs to acquire another mutex, which is held by a
+	// separate goroutine trying to call LocalNodeStore.Get()). In addition,
+	// getMu also guards the complete field, as it is used by Get() to
+	// determine that the LocalNodeStore was stopped. When both mu and getMu
+	// are to be acquired together, mu shall be always acquired first.
+	mu    lock.Mutex
+	getMu lock.RWMutex
 
-	valid    bool
 	value    LocalNode
+	hasValue <-chan struct{}
 	emit     func(LocalNode)
 	complete func(error)
 }
 
-var _ LocalNodeStore = &localNodeStore{}
-
-func NewLocalNodeStore(params LocalNodeStoreParams) (LocalNodeStore, error) {
+func NewTestLocalNodeStore(mockNode LocalNode) *LocalNodeStore {
 	src, emit, complete := stream.Multicast[LocalNode](stream.EmitLatest)
-
-	s := &localNodeStore{
+	emit(mockNode)
+	return &LocalNodeStore{
 		Observable: src,
+		emit:       emit,
+		complete:   complete,
+		value:      mockNode,
+		hasValue: func() <-chan struct{} {
+			ch := make(chan struct{})
+			close(ch)
+			return ch
+		}(),
 	}
-	s.cond = sync.NewCond(&s.mu)
+}
 
-	params.Lifecycle.Append(hive.Hook{
-		OnStart: func(hive.HookContext) error {
+func NewLocalNodeStore(params LocalNodeStoreParams) (*LocalNodeStore, error) {
+	src, emit, complete := stream.Multicast[LocalNode](stream.EmitLatest)
+	hasValue := make(chan struct{})
+
+	s := &LocalNodeStore{
+		Observable: src,
+		value: LocalNode{Node: types.Node{
+			// Explicitly initialize the labels and annotations maps, so that
+			// we don't need to always check for nil values.
+			Labels:      make(map[string]string),
+			Annotations: make(map[string]string),
+		}},
+		hasValue: hasValue,
+	}
+
+	bctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+
+	params.Lifecycle.Append(cell.Hook{
+		OnStart: func(ctx cell.HookContext) error {
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			if params.Init != nil {
-				if err := params.Init.InitLocalNode(&s.value); err != nil {
+			if params.Sync != nil {
+				if err := params.Sync.InitLocalNode(ctx, &s.value); err != nil {
 					return err
 				}
+
+				// Start the synchronization process in background
+				wg.Add(1)
+				go func() {
+					params.Sync.SyncLocalNode(bctx, s)
+					wg.Done()
+				}()
 			}
-			s.valid = true
+
+			// Set the global variable still used by getters
+			// and setters in address.go. We're setting it in Start
+			// to catch uses of it before it's initialized.
+			localNode = s
+
 			s.emit = emit
 			s.complete = complete
-			s.cond.Broadcast()
 			emit(s.value)
+			close(hasValue)
 			return nil
 		},
-		OnStop: func(hive.HookContext) error {
+		OnStop: func(cell.HookContext) error {
+			// Stop the synchronization process (no-op if it had not been started)
+			cancel()
+			wg.Wait()
+
 			s.mu.Lock()
 			s.complete(nil)
+			s.getMu.Lock()
 			s.complete = nil
 			s.emit = nil
+			s.getMu.Unlock()
 			s.mu.Unlock()
+
+			localNode = nil
 			return nil
 		},
 	})
@@ -114,37 +163,38 @@ func NewLocalNodeStore(params LocalNodeStoreParams) (LocalNodeStore, error) {
 	return s, nil
 }
 
-// defaultLocalNodeStore constructs the default instance for the LocalNodeStore used by
-// address.go.
-func defaultLocalNodeStore() LocalNodeStore {
-	src, emit, complete := stream.Multicast[LocalNode](stream.EmitLatest)
-	s := &localNodeStore{
-		Observable: src,
-		valid:      true,
-		emit:       emit,
-		complete:   complete,
+// Get retrieves the current local node. Use Get() only for inspecting the state,
+// e.g. in API handlers. Do not assume the value does not change over time.
+// Blocks until the store has been initialized.
+func (s *LocalNodeStore) Get(ctx context.Context) (LocalNode, error) {
+	select {
+	case <-s.hasValue:
+		s.getMu.RLock()
+		defer s.getMu.RUnlock()
+
+		if s.complete == nil {
+			// Return EOF when the LocalNodeStore is stopped, to preserve the
+			// same behavior of stream.First[LocalNode].
+			return LocalNode{}, io.EOF
+		}
+
+		return s.value, nil
+
+	case <-ctx.Done():
+		return LocalNode{}, ctx.Err()
 	}
-	s.cond = sync.NewCond(&s.mu)
-	return s
 }
 
-func (s *localNodeStore) Get() LocalNode {
+// Update modifies the local node with a mutator. The updated value
+// is passed to observers. Calling LocalNodeStore.Get() from the
+// mutation function is forbidden, and would result in a deadlock.
+func (s *LocalNodeStore) Update(update func(*LocalNode)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Block until the value has been initialized.
-	for !s.valid {
-		s.cond.Wait()
-	}
-
-	return s.value
-}
-
-func (s *localNodeStore) Update(update func(*LocalNode)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	s.getMu.Lock()
 	update(&s.value)
+	s.getMu.Unlock()
 
 	if s.emit != nil {
 		s.emit(s.value)

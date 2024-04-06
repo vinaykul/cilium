@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
 
 #include <bpf/ctx/skb.h>
@@ -9,11 +9,9 @@
 
 #include "lib/utils.h"
 
-#include "lib/common.h"
-
 #include "node_config.h"
 
-#define HAVE_LARGE_INSN_LIMIT
+#include "lib/common.h"
 
 #define htonl bpf_htonl
 #define ntohl bpf_ntohl

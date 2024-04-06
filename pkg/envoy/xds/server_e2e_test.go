@@ -43,9 +43,9 @@ const (
 var (
 	DeferredCompletion = errors.New("Deferred completion")
 	nodes              = map[string]*envoy_config_core.Node{
-		node0: {Id: "sidecar~10.0.0.0~node0~bar"},
-		node1: {Id: "sidecar~10.0.0.1~node1~bar"},
-		node2: {Id: "sidecar~10.0.0.2~node2~bar"},
+		node0: {Id: "node0~10.0.0.0~node0~bar"},
+		node1: {Id: "node1~10.0.0.1~node1~bar"},
+		node2: {Id: "node2~10.0.0.2~node2~bar"},
 	}
 )
 
@@ -116,7 +116,8 @@ func (c *ResponseMatchesChecker) Check(params []interface{}, names []string) (re
 // parameters.
 var ResponseMatches Checker = &ResponseMatchesChecker{
 	&CheckerInfo{Name: "ResponseMatches", Params: []string{
-		"response", "VersionInfo", "Resources", "Canary", "TypeUrl"}},
+		"response", "VersionInfo", "Resources", "Canary", "TypeUrl",
+	}},
 }
 
 var resources = []*envoy_config_route.RouteConfiguration{
@@ -144,8 +145,7 @@ func (s *ServerSuite) TestRequestAllResources(c *C) {
 	stream := NewMockStream(streamCtx, 1, 1, StreamTimeout, StreamTimeout)
 	defer stream.Close()
 
-	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}},
-		TestTimeout)
+	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}})
 
 	streamDone := make(chan struct{})
 
@@ -270,8 +270,7 @@ func (s *ServerSuite) TestAck(c *C) {
 	stream := NewMockStream(streamCtx, 1, 1, StreamTimeout, StreamTimeout)
 	defer stream.Close()
 
-	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}},
-		TestTimeout)
+	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}})
 
 	streamDone := make(chan struct{})
 
@@ -396,8 +395,7 @@ func (s *ServerSuite) TestRequestSomeResources(c *C) {
 	stream := NewMockStream(streamCtx, 1, 1, StreamTimeout, StreamTimeout)
 	defer stream.Close()
 
-	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}},
-		TestTimeout)
+	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}})
 
 	streamDone := make(chan struct{})
 
@@ -570,8 +568,7 @@ func (s *ServerSuite) TestUpdateRequestResources(c *C) {
 	stream := NewMockStream(streamCtx, 1, 1, StreamTimeout, StreamTimeout)
 	defer stream.Close()
 
-	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}},
-		TestTimeout)
+	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}})
 
 	streamDone := make(chan struct{})
 
@@ -673,8 +670,7 @@ func (s *ServerSuite) TestRequestStaleNonce(c *C) {
 	stream := NewMockStream(streamCtx, 1, 1, StreamTimeout, StreamTimeout)
 	defer stream.Close()
 
-	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}},
-		TestTimeout)
+	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}})
 
 	streamDone := make(chan struct{})
 
@@ -813,8 +809,7 @@ func (s *ServerSuite) TestNAck(c *C) {
 	stream := NewMockStream(streamCtx, 1, 1, StreamTimeout, StreamTimeout)
 	defer stream.Close()
 
-	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}},
-		TestTimeout)
+	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}})
 
 	streamDone := make(chan struct{})
 
@@ -948,8 +943,7 @@ func (s *ServerSuite) TestNAckFromTheStart(c *C) {
 	stream := NewMockStream(streamCtx, 1, 1, StreamTimeout, StreamTimeout)
 	defer stream.Close()
 
-	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}},
-		TestTimeout)
+	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}})
 
 	streamDone := make(chan struct{})
 
@@ -1082,8 +1076,7 @@ func (s *ServerSuite) TestRequestHighVersionFromTheStart(c *C) {
 	stream := NewMockStream(streamCtx, 1, 1, StreamTimeout, StreamTimeout)
 	defer stream.Close()
 
-	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}},
-		TestTimeout)
+	server := NewServer(map[string]*ResourceTypeConfiguration{typeURL: {Source: cache, AckObserver: mutator}})
 
 	streamDone := make(chan struct{})
 

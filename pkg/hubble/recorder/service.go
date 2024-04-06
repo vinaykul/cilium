@@ -12,7 +12,6 @@ import (
 	"os"
 	"path"
 	"regexp"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -27,6 +26,7 @@ import (
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/recorder"
+	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
@@ -44,7 +44,7 @@ const (
 type Service struct {
 	recorder *recorder.Recorder
 	dispatch *sink.Dispatch
-	ruleIDs  idpool.IDPool
+	ruleIDs  *idpool.IDPool
 	opts     recorderoption.Options
 }
 

@@ -6,6 +6,7 @@ package loader
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,11 +20,13 @@ import (
 
 	"github.com/cilium/cilium/pkg/datapath/linux/config"
 	"github.com/cilium/cilium/pkg/datapath/loader/metrics"
+	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/elf"
 	"github.com/cilium/cilium/pkg/maps/callsmap"
-	"github.com/cilium/cilium/pkg/maps/ctmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/statedb"
 	"github.com/cilium/cilium/pkg/testutils"
 )
 
@@ -37,10 +40,9 @@ var (
 	contextTimeout = 10 * time.Second
 	benchTimeout   = 5*time.Minute + 5*time.Second
 
-	dirInfo *directoryInfo
-	ep      = testutils.NewTestEndpoint()
-	hostEp  = testutils.NewTestHostEndpoint()
-	bpfDir  = filepath.Join("..", "..", "..", "bpf")
+	ep     = testutils.NewTestEndpoint()
+	hostEp = testutils.NewTestHostEndpoint()
+	bpfDir = filepath.Join("..", "..", "..", "bpf")
 )
 
 // SetTestIncludes allows test files to configure additional include flags.
@@ -55,27 +57,15 @@ func Test(t *testing.T) {
 func (s *LoaderTestSuite) SetUpSuite(c *C) {
 	testutils.PrivilegedTest(c)
 
-	tmpDir, err := os.MkdirTemp("/tmp/", "cilium_")
-	if err != nil {
-		c.Fatalf("Failed to create temporary directory: %s", err)
-	}
-	dirInfo = getDirs(tmpDir)
+	node.SetTestLocalNodeStore()
 
 	cleanup, err := prepareEnv(&ep)
 	if err != nil {
 		SetTestIncludes(nil)
-		os.RemoveAll(tmpDir)
 		c.Fatalf("Failed to prepare environment: %s", err)
 	}
 
-	s.teardown = func() error {
-		if err := cleanup(); err != nil {
-			return err
-		}
-		return os.RemoveAll(tmpDir)
-	}
-
-	ctmap.InitMapInfo(option.CTMapEntriesGlobalTCPDefault, option.CTMapEntriesGlobalAnyDefault, true, true, true)
+	s.teardown = cleanup
 
 	SetTestIncludes([]string{
 		fmt.Sprintf("-I%s", bpfDir),
@@ -101,6 +91,7 @@ func (s *LoaderTestSuite) TearDownSuite(c *C) {
 			c.Fatal(err)
 		}
 	}
+	node.UnsetTestLocalNodeStore()
 }
 
 func (s *LoaderTestSuite) TearDownTest(c *C) {
@@ -123,24 +114,24 @@ func prepareEnv(ep *testutils.TestEndpoint) (func() error, error) {
 	}
 	if err := netlink.LinkAdd(&link); err != nil {
 		if !os.IsExist(err) {
-			return nil, fmt.Errorf("Failed to add link: %s", err)
+			return nil, fmt.Errorf("Failed to add link: %w", err)
 		}
 	}
 	cleanupFn := func() error {
 		if err := netlink.LinkDel(&link); err != nil {
-			return fmt.Errorf("Failed to delete link: %s", err)
+			return fmt.Errorf("Failed to delete link: %w", err)
 		}
 		return nil
 	}
 	return cleanupFn, nil
 }
 
-func getDirs(tmpDir string) *directoryInfo {
+func getDirs(tb testing.TB) *directoryInfo {
 	return &directoryInfo{
 		Library: bpfDir,
 		Runtime: bpfDir,
 		State:   bpfDir,
-		Output:  tmpDir,
+		Output:  tb.TempDir(),
 	}
 }
 
@@ -149,8 +140,8 @@ func (s *LoaderTestSuite) testCompileAndLoad(c *C, ep *testutils.TestEndpoint) {
 	defer cancel()
 	stats := &metrics.SpanStat{}
 
-	l := &Loader{}
-	err := l.compileAndLoad(ctx, ep, dirInfo, stats)
+	l := NewLoaderForTest(c)
+	err := l.compileAndLoad(ctx, ep, getDirs(c), stats)
 	c.Assert(err, IsNil)
 }
 
@@ -184,6 +175,7 @@ func (s *LoaderTestSuite) TestReload(c *C) {
 	ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
 	defer cancel()
 
+	dirInfo := getDirs(c)
 	err := compileDatapath(ctx, dirInfo, false, log)
 	c.Assert(err, IsNil)
 
@@ -192,11 +184,18 @@ func (s *LoaderTestSuite) TestReload(c *C) {
 		{progName: symbolFromEndpoint, direction: dirIngress},
 		{progName: symbolToEndpoint, direction: dirEgress},
 	}
-	finalize, err := replaceDatapath(ctx, ep.InterfaceName(), objPath, progs, "")
+	opts := replaceDatapathOptions{
+		device:   ep.InterfaceName(),
+		elf:      objPath,
+		programs: progs,
+		linkDir:  testutils.TempBPFFS(c),
+	}
+	finalize, err := replaceDatapath(ctx, opts)
 	c.Assert(err, IsNil)
 	finalize()
 
-	finalize, err = replaceDatapath(ctx, ep.InterfaceName(), objPath, progs, "")
+	finalize, err = replaceDatapath(ctx, opts)
+
 	c.Assert(err, IsNil)
 	finalize()
 }
@@ -216,12 +215,12 @@ func (s *LoaderTestSuite) testCompileFailure(c *C, ep *testutils.TestEndpoint) {
 		}
 	}()
 
-	l := &Loader{}
+	l := NewLoaderForTest(c)
 	timeout := time.Now().Add(contextTimeout)
 	var err error
 	stats := &metrics.SpanStat{}
 	for err == nil && time.Now().Before(timeout) {
-		err = l.compileAndLoad(ctx, ep, dirInfo, stats)
+		err = l.compileAndLoad(ctx, ep, getDirs(c), stats)
 	}
 	c.Assert(err, NotNil)
 }
@@ -238,10 +237,67 @@ func (s *LoaderTestSuite) TestCompileFailureHostEndpoint(c *C) {
 	s.testCompileFailure(c, &hostEp)
 }
 
+func (s *LoaderTestSuite) TestBPFMasqAddrs(c *C) {
+	old4 := option.Config.EnableIPv4Masquerade
+	option.Config.EnableIPv4Masquerade = true
+	old6 := option.Config.EnableIPv4Masquerade
+	option.Config.EnableIPv6Masquerade = true
+	c.Cleanup(func() {
+		option.Config.EnableIPv4Masquerade = old4
+		option.Config.EnableIPv6Masquerade = old6
+	})
+
+	l := NewLoaderForTest(c)
+	nodeAddrs := l.nodeAddrs.(statedb.RWTable[tables.NodeAddress])
+	db := l.db
+
+	masq4, masq6 := l.bpfMasqAddrs("test")
+	c.Assert(masq4.IsValid(), Equals, false)
+	c.Assert(masq6.IsValid(), Equals, false)
+
+	txn := db.WriteTxn(nodeAddrs)
+	nodeAddrs.Insert(txn, tables.NodeAddress{
+		Addr:       netip.MustParseAddr("1.0.0.1"),
+		NodePort:   true,
+		Primary:    true,
+		DeviceName: "test",
+	})
+	nodeAddrs.Insert(txn, tables.NodeAddress{
+		Addr:       netip.MustParseAddr("1000::1"),
+		NodePort:   true,
+		Primary:    true,
+		DeviceName: "test",
+	})
+	nodeAddrs.Insert(txn, tables.NodeAddress{
+		Addr:       netip.MustParseAddr("2.0.0.2"),
+		NodePort:   false,
+		Primary:    true,
+		DeviceName: tables.WildcardDeviceName,
+	})
+	nodeAddrs.Insert(txn, tables.NodeAddress{
+		Addr:       netip.MustParseAddr("2000::2"),
+		NodePort:   false,
+		Primary:    true,
+		DeviceName: tables.WildcardDeviceName,
+	})
+	txn.Commit()
+
+	masq4, masq6 = l.bpfMasqAddrs("test")
+	c.Assert(masq4.String(), Equals, "1.0.0.1")
+	c.Assert(masq6.String(), Equals, "1000::1")
+
+	masq4, masq6 = l.bpfMasqAddrs("unknown")
+	c.Assert(masq4.String(), Equals, "2.0.0.2")
+	c.Assert(masq6.String(), Equals, "2000::2")
+}
+
 // BenchmarkCompileOnly benchmarks the just the entire compilation process.
 func BenchmarkCompileOnly(b *testing.B) {
 	ctx, cancel := context.WithTimeout(context.Background(), benchTimeout)
 	defer cancel()
+
+	dirInfo := getDirs(b)
+	option.Config.Debug = true
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -257,7 +313,8 @@ func BenchmarkCompileAndLoad(b *testing.B) {
 	ctx, cancel := context.WithTimeout(context.Background(), benchTimeout)
 	defer cancel()
 
-	l := &Loader{}
+	l := NewLoaderForTest(b)
+	dirInfo := getDirs(b)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -273,15 +330,25 @@ func BenchmarkReplaceDatapath(b *testing.B) {
 	ctx, cancel := context.WithTimeout(context.Background(), benchTimeout)
 	defer cancel()
 
+	dirInfo := getDirs(b)
+
 	if err := compileDatapath(ctx, dirInfo, false, log); err != nil {
 		b.Fatal(err)
 	}
 
 	objPath := fmt.Sprintf("%s/%s", dirInfo.Output, endpointObj)
+	linkDir := testutils.TempBPFFS(b)
 	progs := []progDefinition{{progName: symbolFromEndpoint, direction: dirIngress}}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		finalize, err := replaceDatapath(ctx, ep.InterfaceName(), objPath, progs, "")
+		finalize, err := replaceDatapath(ctx,
+			replaceDatapathOptions{
+				device:   ep.InterfaceName(),
+				elf:      objPath,
+				programs: progs,
+				linkDir:  linkDir,
+			},
+		)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -332,7 +399,7 @@ func BenchmarkCompileOrLoad(b *testing.B) {
 	}
 	defer os.RemoveAll(epDir)
 
-	l := &Loader{}
+	l := NewLoaderForTest(b)
 	l.templateCache = newObjectCache(&config.HeaderfileWriter{}, nil, tmpDir)
 	if err := l.CompileOrLoad(ctx, &ep, nil); err != nil {
 		log.Warningf("Failure in %s: %s", tmpDir, err)

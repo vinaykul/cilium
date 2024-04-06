@@ -48,6 +48,9 @@ const (
 	// NetworkPolicyHostsTypeURL is the type URL of NetworkPolicyHosts resources.
 	NetworkPolicyHostsTypeURL = "type.googleapis.com/cilium.NetworkPolicyHosts"
 
+	// HealthCheckSinkPipeTypeURL is the type URL of NetworkPolicyHosts resources.
+	HealthCheckSinkPipeTypeURL = "type.googleapis.com/cilium.health_check.event_sink.pipe"
+
 	// DownstreamTlsContextURL is the type URL of DownstreamTlsContext
 	DownstreamTlsContextURL = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext"
 )
@@ -72,24 +75,17 @@ func newNPHDSCache(ipcache IPCacheEventSource) NPHDSCache {
 	return NPHDSCache{Cache: xds.NewCache(), ipcache: ipcache}
 }
 
-var (
-	observerOnce = sync.Once{}
-)
+var observerOnce = sync.Once{}
 
 // HandleResourceVersionAck is required to implement ResourceVersionAckObserver.
 // We use this to start the IP Cache listener on the first ACK so that we only
-// start the IP Cache listener if there is an Envoy node that uses NPHDS (e.g.,
-// Istio node, or host proxy running on kernel w/o LPM bpf map support).
+// start the IP Cache listener if there is an Envoy node that uses NPHDS
+// (e.g. Cilium host proxy running on kernel w/o LPM bpf map support).
 func (cache *NPHDSCache) HandleResourceVersionAck(ackVersion uint64, nackVersion uint64, nodeIP string, resourceNames []string, typeURL string, detail string) {
 	// Start caching for IP/ID mappings on the first indication someone wants them
 	observerOnce.Do(func() {
 		cache.ipcache.AddListener(cache)
 	})
-}
-
-// OnIPIdentityCacheGC is required to implement IPIdentityMappingListener.
-func (cache *NPHDSCache) OnIPIdentityCacheGC() {
-	// We don't have anything to synchronize in this case.
 }
 
 // OnIPIdentityCacheChange pushes modifications to the IP<->Identity mapping
@@ -100,7 +96,8 @@ func (cache *NPHDSCache) OnIPIdentityCacheGC() {
 // IP/ID mappings.
 func (cache *NPHDSCache) OnIPIdentityCacheChange(modType ipcache.CacheModification, cidrCluster cmtypes.PrefixCluster,
 	oldHostIP, newHostIP net.IP, oldID *ipcache.Identity, newID ipcache.Identity,
-	encryptKey uint8, nodeID uint16, k8sMeta *ipcache.K8sMetadata) {
+	encryptKey uint8, k8sMeta *ipcache.K8sMetadata,
+) {
 	cidr := cidrCluster.AsIPNet()
 
 	cidrStr := cidr.String()
@@ -130,7 +127,7 @@ func (cache *NPHDSCache) OnIPIdentityCacheChange(modType ipcache.CacheModificati
 		// but only if the old ID is different.
 		if oldID != nil && oldID.ID != newID.ID {
 			// Recursive call to delete the 'cidr' from the 'oldID'
-			cache.OnIPIdentityCacheChange(ipcache.Delete, cidrCluster, nil, nil, nil, *oldID, encryptKey, nodeID, k8sMeta)
+			cache.OnIPIdentityCacheChange(ipcache.Delete, cidrCluster, nil, nil, nil, *oldID, encryptKey, k8sMeta)
 		}
 		err := cache.handleIPUpsert(npHost, resourceName, cidrStr, newID.ID)
 		if err != nil {

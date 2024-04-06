@@ -277,6 +277,14 @@ func (in *CiliumEnvoyConfigSpec) DeepEqual(other *CiliumEnvoyConfigSpec) bool {
 		}
 	}
 
+	if (in.NodeSelector == nil) != (other.NodeSelector == nil) {
+		return false
+	} else if in.NodeSelector != nil {
+		if !in.NodeSelector.DeepEqual(other.NodeSelector) {
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -1068,6 +1076,9 @@ func (in *NodeSpec) DeepEqual(other *NodeSpec) bool {
 	}
 
 	if in.InstanceID != other.InstanceID {
+		return false
+	}
+	if in.BootID != other.BootID {
 		return false
 	}
 	if ((in.Addresses != nil) && (other.Addresses != nil)) || ((in.Addresses == nil) != (other.Addresses == nil)) {

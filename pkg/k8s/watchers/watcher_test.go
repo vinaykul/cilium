@@ -4,6 +4,7 @@
 package watchers
 
 import (
+	"context"
 	"sort"
 	"testing"
 
@@ -12,10 +13,12 @@ import (
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/checker"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
-	fakeDatapath "github.com/cilium/cilium/pkg/datapath/fake"
+	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
 	"github.com/cilium/cilium/pkg/k8s"
+	"github.com/cilium/cilium/pkg/k8s/client"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	"github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/lock"
@@ -37,18 +40,6 @@ var _ = Suite(&K8sWatcherSuite{})
 var emptyResources = agentK8s.Resources{}
 
 type fakeWatcherConfiguration struct{}
-
-func (f *fakeWatcherConfiguration) K8sServiceProxyNameValue() string {
-	return ""
-}
-
-func (f *fakeWatcherConfiguration) K8sIngressControllerEnabled() bool {
-	return false
-}
-
-func (f *fakeWatcherConfiguration) K8sGatewayAPIEnabled() bool {
-	return false
-}
 
 func (f *fakeWatcherConfiguration) K8sNetworkPolicyEnabled() bool {
 	return true
@@ -84,7 +75,6 @@ func (f *fakePolicyManager) PolicyDelete(labels labels.LabelArray, opts *policy.
 
 type fakePolicyRepository struct {
 	OnGetSelectorCache func() *policy.SelectorCache
-	OnTranslateRules   func(translator policy.Translator) (*policy.TranslationResult, error)
 }
 
 func (f *fakePolicyRepository) GetSelectorCache() *policy.SelectorCache {
@@ -92,13 +82,6 @@ func (f *fakePolicyRepository) GetSelectorCache() *policy.SelectorCache {
 		return f.OnGetSelectorCache()
 	}
 	panic("OnGetSelectorCache() (*policy.SelectorCache) was called and is not set!")
-}
-
-func (f *fakePolicyRepository) TranslateRules(translator policy.Translator) (*policy.TranslationResult, error) {
-	if f.OnTranslateRules != nil {
-		return f.OnTranslateRules(translator)
-	}
-	panic("OnTranslateRules(policy.Translator) (*policy.TranslationResult, error) was called and is not set!")
 }
 
 type fakeSvcManager struct {
@@ -113,125 +96,15 @@ func (f *fakeSvcManager) DeleteService(frontend loadbalancer.L3n4Addr) (bool, er
 	panic("OnDeleteService(loadbalancer.L3n4Addr) (bool, error) was called and is not set!")
 }
 
+func (f *fakeSvcManager) GetDeepCopyServiceByFrontend(frontend loadbalancer.L3n4Addr) (*loadbalancer.SVC, bool) {
+	return nil, false
+}
+
 func (f *fakeSvcManager) UpsertService(p *loadbalancer.SVC) (bool, loadbalancer.ID, error) {
 	if f.OnUpsertService != nil {
 		return f.OnUpsertService(p)
 	}
 	panic("OnUpsertService() was called and is not set!")
-}
-
-func (f *fakeSvcManager) RegisterL7LBService(serviceName, resourceName loadbalancer.ServiceName, ports []string, proxyPort uint16) error {
-	return nil
-}
-
-func (f *fakeSvcManager) RegisterL7LBServiceBackendSync(serviceName, resourceName loadbalancer.ServiceName, ports []string) error {
-	return nil
-}
-
-func (f *fakeSvcManager) RemoveL7LBService(serviceName, resourceName loadbalancer.ServiceName) error {
-	return nil
-}
-
-func (s *K8sWatcherSuite) TestUpdateToServiceEndpointsGH9525(c *C) {
-
-	ep1stApply := &slim_corev1.Endpoints{
-		ObjectMeta: slim_metav1.ObjectMeta{
-			Name:      "foo",
-			Namespace: "bar",
-		},
-		Subsets: []slim_corev1.EndpointSubset{
-			{
-				Addresses: []slim_corev1.EndpointAddress{{IP: "10.0.0.2"}},
-				Ports: []slim_corev1.EndpointPort{
-					{
-						Name:     "http-test-svc",
-						Port:     8080,
-						Protocol: slim_corev1.ProtocolTCP,
-					},
-				},
-			},
-		},
-	}
-
-	ep2ndApply := ep1stApply.DeepCopy()
-	ep2ndApply.Subsets[0].Addresses = append(
-		ep2ndApply.Subsets[0].Addresses,
-		slim_corev1.EndpointAddress{IP: "10.0.0.3"},
-	)
-
-	policyManagerCalls := 0
-	policyManager := &fakePolicyManager{
-		OnTriggerPolicyUpdates: func(force bool, reason string) {
-			policyManagerCalls++
-		},
-	}
-	policyRepositoryCalls := 0
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			rt, ok := tr.(k8s.RuleTranslator)
-			c.Assert(ok, Equals, true)
-			switch policyRepositoryCalls {
-			case 0:
-				_, parsedEPs := k8s.ParseEndpoints(ep1stApply)
-				c.Assert(rt.Endpoint.Backends, checker.DeepEquals, parsedEPs.Backends)
-			case 1:
-				_, parsedEPs := k8s.ParseEndpoints(ep2ndApply)
-				c.Assert(rt.Endpoint.Backends, checker.DeepEquals, parsedEPs.Backends)
-			default:
-				c.Assert(policyRepositoryCalls, Not(Equals), 0, Commentf("policy repository was called more times than expected!"))
-			}
-			policyRepositoryCalls++
-
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
-
-	dp := fakeDatapath.NewDatapath()
-	w := NewK8sWatcher(
-		nil,
-		nil,
-		nil,
-		policyManager,
-		policyRepository,
-		nil,
-		dp,
-		nil,
-		nil,
-		nil,
-		nil,
-		&fakeWatcherConfiguration{},
-		testipcache.NewMockIPCache(),
-		nil,
-		emptyResources,
-		k8s.NewServiceCache(dp.LocalNodeAddressing()),
-	)
-	go w.k8sServiceHandler()
-	swg := lock.NewStoppableWaitGroup()
-
-	k8sSvc := &slim_corev1.Service{
-		ObjectMeta: slim_metav1.ObjectMeta{
-			Name:      "foo",
-			Namespace: "bar",
-			Labels: map[string]string{
-				"foo": "bar",
-			},
-		},
-		Spec: slim_corev1.ServiceSpec{
-			ClusterIP: "127.0.0.1",
-			Type:      slim_corev1.ServiceTypeClusterIP,
-		},
-	}
-
-	w.K8sSvcCache.UpdateService(k8sSvc, swg)
-	w.K8sSvcCache.UpdateEndpoints(ep1stApply, swg)
-	// Running a 2nd update should also trigger a new policy update
-	w.K8sSvcCache.UpdateEndpoints(ep2ndApply, swg)
-
-	swg.Stop()
-	swg.Wait()
-
-	c.Assert(policyRepositoryCalls, Equals, 2)
-	c.Assert(policyManagerCalls, Equals, 2)
 }
 
 func (s *K8sWatcherSuite) Test_addK8sSVCs_ClusterIP(c *C) {
@@ -472,11 +345,7 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ClusterIP(c *C) {
 		OnTriggerPolicyUpdates: func(force bool, reason string) {
 		},
 	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
+	policyRepository := &fakePolicyRepository{}
 
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 
@@ -511,8 +380,10 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ClusterIP(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
+	dp := fakeTypes.NewDatapath()
 	w := NewK8sWatcher(
+		nil,
+		nil,
 		nil,
 		nil,
 		nil,
@@ -522,24 +393,23 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ClusterIP(c *C) {
 		dp,
 		nil,
 		nil,
-		nil,
-		nil,
 		&fakeWatcherConfiguration{},
 		testipcache.NewMockIPCache(),
 		nil,
 		emptyResources,
 		k8s.NewServiceCache(dp.LocalNodeAddressing()),
+		nil,
 	)
 	go w.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
 	w.K8sSvcCache.UpdateService(k8sSvc, swg)
-	w.K8sSvcCache.UpdateEndpoints(ep1stApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
 	// Running a 2nd update should also trigger a new upsert service
-	w.K8sSvcCache.UpdateEndpoints(ep2ndApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 	// Running a 3rd update should also not trigger anything because the
 	// endpoints are the same
-	w.K8sSvcCache.UpdateEndpoints(ep2ndApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 
 	w.K8sSvcCache.DeleteService(k8sSvc, swg)
 
@@ -642,11 +512,7 @@ func (s *K8sWatcherSuite) TestChangeSVCPort(c *C) {
 		OnTriggerPolicyUpdates: func(force bool, reason string) {
 		},
 	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
+	policyRepository := &fakePolicyRepository{}
 
 	svcUpsertManagerCalls := 0
 
@@ -665,8 +531,10 @@ func (s *K8sWatcherSuite) TestChangeSVCPort(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
+	dp := fakeTypes.NewDatapath()
 	w := NewK8sWatcher(
+		nil,
+		nil,
 		nil,
 		nil,
 		nil,
@@ -676,19 +544,18 @@ func (s *K8sWatcherSuite) TestChangeSVCPort(c *C) {
 		dp,
 		nil,
 		nil,
-		nil,
-		nil,
 		&fakeWatcherConfiguration{},
 		testipcache.NewMockIPCache(),
 		nil,
 		emptyResources,
 		k8s.NewServiceCache(dp.LocalNodeAddressing()),
+		nil,
 	)
 	go w.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
 	w.K8sSvcCache.UpdateService(k8sSvc, swg)
-	w.K8sSvcCache.UpdateEndpoints(ep1stApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
 	w.K8sSvcCache.UpdateService(k8sSvcChanged, swg)
 
 	swg.Stop()
@@ -839,8 +706,8 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_NodePort(c *C) {
 		},
 	}
 
-	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4NodePortAddress)
-	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4InternalAddress)
+	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4NodePortAddress)
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
 
 	nodePortIPs1 := []*loadbalancer.L3n4AddrID{
 		loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("0.0.0.0"), 18080, loadbalancer.ScopeExternal, 0),
@@ -1109,11 +976,7 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_NodePort(c *C) {
 		OnTriggerPolicyUpdates: func(force bool, reason string) {
 		},
 	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
+	policyRepository := &fakePolicyRepository{}
 
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 
@@ -1148,8 +1011,10 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_NodePort(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
+	dp := fakeTypes.NewDatapath()
 	w := NewK8sWatcher(
+		nil,
+		nil,
 		nil,
 		nil,
 		nil,
@@ -1159,24 +1024,23 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_NodePort(c *C) {
 		dp,
 		nil,
 		nil,
-		nil,
-		nil,
 		&fakeWatcherConfiguration{},
 		testipcache.NewMockIPCache(),
 		nil,
 		emptyResources,
 		k8s.NewServiceCache(dp.LocalNodeAddressing()),
+		nil,
 	)
 	go w.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
 	w.K8sSvcCache.UpdateService(k8sSvc, swg)
-	w.K8sSvcCache.UpdateEndpoints(ep1stApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
 	// Running a 2nd update should also trigger a new upsert service
-	w.K8sSvcCache.UpdateEndpoints(ep2ndApply, swg)
-	// Running a 3rd update should not trigger anything because the
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
+	// Running a 3rd update should also not trigger anything because the
 	// endpoints are the same
-	w.K8sSvcCache.UpdateEndpoints(ep2ndApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 
 	w.K8sSvcCache.DeleteService(k8sSvc, swg)
 
@@ -1281,8 +1145,8 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_1(c *C) {
 
 	clusterIP1 := loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("172.0.20.1"), 80, loadbalancer.ScopeExternal, 0)
 	clusterIP2 := loadbalancer.NewL3n4AddrID(loadbalancer.TCP, cmtypes.MustParseAddrCluster("172.0.20.1"), 81, loadbalancer.ScopeExternal, 0)
-	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4NodePortAddress)
-	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4InternalAddress)
+	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4NodePortAddress)
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
 
 	nodePortIPs1 := []*loadbalancer.L3n4AddrID{
 		loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("0.0.0.0"), 18080, loadbalancer.ScopeExternal, 0),
@@ -1424,11 +1288,7 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_1(c *C) {
 		OnTriggerPolicyUpdates: func(force bool, reason string) {
 		},
 	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
+	policyRepository := &fakePolicyRepository{}
 
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 	wantSvcUpsertManagerCalls := len(upsert1stWanted) + len(upsert2ndWanted)
@@ -1465,8 +1325,10 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_1(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
+	dp := fakeTypes.NewDatapath()
 	w := NewK8sWatcher(
+		nil,
+		nil,
 		nil,
 		nil,
 		nil,
@@ -1476,19 +1338,18 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_1(c *C) {
 		dp,
 		nil,
 		nil,
-		nil,
-		nil,
 		&fakeWatcherConfiguration{},
 		testipcache.NewMockIPCache(),
 		nil,
 		emptyResources,
 		k8s.NewServiceCache(dp.LocalNodeAddressing()),
+		nil,
 	)
 	go w.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
 	w.K8sSvcCache.UpdateService(k8sSvc1stApply, swg)
-	w.K8sSvcCache.UpdateEndpoints(ep1stApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
 
 	w.K8sSvcCache.UpdateService(k8sSvc2ndApply, swg)
 
@@ -1587,8 +1448,8 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_2(c *C) {
 
 	clusterIP1 := loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("172.0.20.1"), 80, loadbalancer.ScopeExternal, 0)
 	clusterIP2 := loadbalancer.NewL3n4AddrID(loadbalancer.TCP, cmtypes.MustParseAddrCluster("172.0.20.1"), 81, loadbalancer.ScopeExternal, 0)
-	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4NodePortAddress)
-	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4InternalAddress)
+	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4NodePortAddress)
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
 
 	nodePortIPs1 := []*loadbalancer.L3n4AddrID{
 		loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("0.0.0.0"), 18080, loadbalancer.ScopeExternal, 0),
@@ -1734,11 +1595,7 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_2(c *C) {
 		OnTriggerPolicyUpdates: func(force bool, reason string) {
 		},
 	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
+	policyRepository := &fakePolicyRepository{}
 
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 	wantSvcUpsertManagerCalls := len(upsert1stWanted) + len(upsert2ndWanted)
@@ -1775,8 +1632,10 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_2(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
+	dp := fakeTypes.NewDatapath()
 	w := NewK8sWatcher(
+		nil,
+		nil,
 		nil,
 		nil,
 		nil,
@@ -1786,20 +1645,19 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_2(c *C) {
 		dp,
 		nil,
 		nil,
-		nil,
-		nil,
 		&fakeWatcherConfiguration{},
 		testipcache.NewMockIPCache(),
 		nil,
 		emptyResources,
 		k8s.NewServiceCache(dp.LocalNodeAddressing()),
+		nil,
 	)
 	go w.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
 	w.K8sSvcCache.UpdateService(k8sSvc1stApply, swg)
-	w.K8sSvcCache.UpdateEndpoints(ep1stApply, swg)
-	w.K8sSvcCache.UpdateEndpoints(ep2ndApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 
 	swg.Stop()
 	swg.Wait()
@@ -2025,8 +1883,8 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
 		}
 	}
 
-	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4NodePortAddress)
-	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4InternalAddress)
+	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4NodePortAddress)
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
 
 	nodePortIPs1 := []*loadbalancer.L3n4AddrID{
 		loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("0.0.0.0"), 18080, loadbalancer.ScopeExternal, 0),
@@ -2646,11 +2504,7 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
 		OnTriggerPolicyUpdates: func(force bool, reason string) {
 		},
 	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
+	policyRepository := &fakePolicyRepository{}
 
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 
@@ -2699,8 +2553,10 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
+	dp := fakeTypes.NewDatapath()
 	w := NewK8sWatcher(
+		nil,
+		nil,
 		nil,
 		nil,
 		nil,
@@ -2710,24 +2566,23 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
 		dp,
 		nil,
 		nil,
-		nil,
-		nil,
 		&fakeWatcherConfiguration{},
 		testipcache.NewMockIPCache(),
 		nil,
 		emptyResources,
 		k8s.NewServiceCache(dp.LocalNodeAddressing()),
+		nil,
 	)
 	go w.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
 	w.K8sSvcCache.UpdateService(svc1stApply, swg)
-	w.K8sSvcCache.UpdateEndpoints(ep1stApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
 	// Running a 2nd update should also trigger a new upsert service
-	w.K8sSvcCache.UpdateEndpoints(ep2ndApply, swg)
-	// Running a 3rd update should not trigger anything because the
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
+	// Running a 3rd update should also not trigger anything because the
 	// endpoints are the same
-	w.K8sSvcCache.UpdateEndpoints(ep2ndApply, swg)
+	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 
 	w.K8sSvcCache.UpdateService(svc2ndApply, swg)
 
@@ -2743,4 +2598,43 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
 	c.Assert(upsert3rd, checker.DeepEquals, upsert3rdWanted)
 	c.Assert(del1st, checker.DeepEquals, del1stWanted)
 	c.Assert(del2nd, checker.DeepEquals, del2ndWanted)
+}
+
+func (s *K8sWatcherSuite) Test_No_Resources_InitK8sSubsystem(c *C) {
+	fakeClientSet, _ := client.NewFakeClientset()
+
+	w := NewK8sWatcher(
+		fakeClientSet,
+		&synced.Resources{},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		&fakeWatcherConfiguration{},
+		testipcache.NewMockIPCache(),
+		nil,
+		emptyResources,
+		nil,
+		nil,
+	)
+
+	// ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	deadline, _ := c.Deadline()
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	cachesSynced := make(chan struct{})
+	w.InitK8sSubsystem(ctx, []string{}, []string{}, cachesSynced)
+	// Expect channel to be closed.
+	select {
+	case <-ctx.Done():
+		c.Fail()
+	case _, ok := <-cachesSynced:
+		c.Assert(ok, Equals, false)
+	}
 }

@@ -14,7 +14,6 @@ import (
 )
 
 var (
-	cgroupRoot = cgroups.GetCgroupRoot()
 	// example default cgroup path in kubernetes environments
 	// /kubepods/burstable/pod1858680e-b044-4fd5-9dd4-f137e30e2180/e275d1a37782ab30008aa3ae6666cccefe53b3a14a2ab5a8dc459939107c8c0
 	defaultCgroupBasePath = "/kubepods"
@@ -142,12 +141,12 @@ func getSystemdContainerPathCommon(subPaths []string, podId string, containerId 
 	podIdStr := fmt.Sprintf("pod%s", podId)
 	if qos == v1.PodQOSGuaranteed {
 		if path, err = toSystemd(append(subPaths, podIdStr)); err != nil {
-			return "", fmt.Errorf("unable to construct cgroup path %w", err)
+			return "", fmt.Errorf("unable to construct cgroup path: %w", err)
 		}
 	} else {
 		qosStr := strings.ToLower(string(qos))
 		if path, err = toSystemd(append(subPaths, qosStr, podIdStr)); err != nil {
-			return "", fmt.Errorf("unable to construct cgroup path %w", err)
+			return "", fmt.Errorf("unable to construct cgroup path: %w", err)
 		}
 	}
 	// construct and append container sub path with container id
@@ -164,7 +163,7 @@ func getSystemdContainerPathCommon(subPaths []string, podId string, containerId 
 }
 
 func validateCgroupPath(path string) (string, error) {
-	fullPath := cgroupRoot + path
+	fullPath := cgroups.GetCgroupRoot() + path
 
 	if _, err := fschecker.Stat(fullPath); err == nil {
 		return fullPath, nil
@@ -212,7 +211,7 @@ func toSystemd(cgroupName []string) (string, error) {
 
 	result, err := expandSlice(strings.Join(newparts, "-") + systemdSuffix)
 	if err != nil {
-		return "", fmt.Errorf("error converting cgroup name [%v] to systemd format: %v", cgroupName, err)
+		return "", fmt.Errorf("error converting cgroup name [%v] to systemd format: %w", cgroupName, err)
 	}
 	return result, nil
 }

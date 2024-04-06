@@ -151,13 +151,13 @@ func copyWait(dst io.Writer, src io.Reader) chan error {
 func runCommand(session *ssh.Session, cmd *SSHCommand) (bool, error) {
 	stderr, err := session.StderrPipe()
 	if err != nil {
-		return false, fmt.Errorf("Unable to setup stderr for session: %v", err)
+		return false, fmt.Errorf("Unable to setup stderr for session: %w", err)
 	}
 	errChan := copyWait(cmd.Stderr, stderr)
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return false, fmt.Errorf("Unable to setup stdout for session: %v", err)
+		return false, fmt.Errorf("Unable to setup stdout for session: %w", err)
 	}
 	outChan := copyWait(cmd.Stdout, stdout)
 
@@ -216,22 +216,20 @@ func (client *SSHClient) RunCommandInBackground(ctx context.Context, cmd *SSHCom
 	}
 
 	go func() {
-		select {
-		case <-ctx.Done():
-			_, err := stdin.Write([]byte{3})
-			if err != nil {
-				log.Errorf("write ^C error: %s", err)
-			}
-			err = session.Wait()
-			if err != nil {
-				log.Errorf("wait error: %s", err)
-			}
-			if err = session.Signal(ssh.SIGHUP); err != nil {
-				log.Errorf("failed to kill command: %s", err)
-			}
-			if err = session.Close(); err != nil {
-				log.Errorf("failed to close session: %s", err)
-			}
+		<-ctx.Done()
+		_, err := stdin.Write([]byte{3})
+		if err != nil {
+			log.Errorf("write ^C error: %s", err)
+		}
+		err = session.Wait()
+		if err != nil {
+			log.Errorf("wait error: %s", err)
+		}
+		if err = session.Signal(ssh.SIGHUP); err != nil {
+			log.Errorf("failed to kill command: %s", err)
+		}
+		if err = session.Close(); err != nil {
+			log.Errorf("failed to close session: %s", err)
 		}
 	}()
 	_, err = runCommand(session, cmd)
@@ -305,14 +303,14 @@ func (client *SSHClient) newSession() (*ssh.Session, error) {
 			client.Config)
 
 		if err != nil {
-			return nil, fmt.Errorf("failed to dial: %s", err)
+			return nil, fmt.Errorf("failed to dial: %w", err)
 		}
 		client.client = connection
 	}
 
 	session, err := connection.NewSession()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create session: %s", err)
+		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
 	return session, nil

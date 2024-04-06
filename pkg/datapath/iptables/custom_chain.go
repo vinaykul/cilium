@@ -8,8 +8,6 @@ import (
 	"strings"
 
 	"github.com/mattn/go-shellwords"
-
-	"github.com/cilium/cilium/pkg/option"
 )
 
 type customChain struct {
@@ -96,7 +94,7 @@ var ciliumChains = []customChain{
 	},
 }
 
-func (c *customChain) exists(prog iptablesInterface) (bool, error) {
+func (c *customChain) exists(prog runnable) (bool, error) {
 	args := []string{"-t", c.table, "-S", c.name}
 
 	output, err := prog.runProgOutput(args)
@@ -123,7 +121,7 @@ func (c *customChain) exists(prog iptablesInterface) (bool, error) {
 	return true, nil
 }
 
-func (c *customChain) doAdd(prog iptablesInterface) error {
+func (c *customChain) doAdd(prog runnable) error {
 	args := []string{"-t", c.table, "-N", c.name}
 
 	output, err := prog.runProgOutput(args)
@@ -149,7 +147,7 @@ func (c *customChain) add(ipv4, ipv6 bool) error {
 	return nil
 }
 
-func (c *customChain) doRename(prog iptablesInterface, newName string) error {
+func (c *customChain) doRename(prog runnable, newName string) error {
 	if exists, err := c.exists(prog); err != nil {
 		return err
 	} else if !exists {
@@ -220,9 +218,9 @@ func (c *customChain) remove(ipv4, ipv6 bool) error {
 	return nil
 }
 
-func (c *customChain) doInstallFeeder(prog iptablesInterface, feedArgs string) error {
+func (c *customChain) doInstallFeeder(prog iptablesInterface, feedArgs string, prepend bool) error {
 	installMode := "-A"
-	if option.Config.PrependIptablesChains {
+	if prepend {
 		installMode = "-I"
 	}
 
@@ -246,15 +244,15 @@ func (c *customChain) doInstallFeeder(prog iptablesInterface, feedArgs string) e
 	return nil
 }
 
-func (c *customChain) installFeeder(ipv4, ipv6 bool) error {
+func (c *customChain) installFeeder(ipv4, ipv6, prepend bool) error {
 	for _, feedArgs := range c.feederArgs {
 		if ipv4 {
-			if err := c.doInstallFeeder(ip4tables, feedArgs); err != nil {
+			if err := c.doInstallFeeder(ip4tables, feedArgs, prepend); err != nil {
 				return err
 			}
 		}
 		if ipv6 && c.ipv6 {
-			if err := c.doInstallFeeder(ip6tables, feedArgs); err != nil {
+			if err := c.doInstallFeeder(ip6tables, feedArgs, prepend); err != nil {
 				return err
 			}
 		}

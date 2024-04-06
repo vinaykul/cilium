@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -22,10 +23,10 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/cilium/cilium/pkg/checker"
+	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/k8s"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/utils"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -34,7 +35,6 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/metrics"
-	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/testutils"
@@ -182,7 +182,7 @@ var (
 // getXDSNetworkPolicies returns the representation of the xDS network policies
 // as a map of IP addresses to NetworkPolicy objects
 func (ds *DaemonSuite) getXDSNetworkPolicies(c *C, resourceNames []string) map[string]*cilium.NetworkPolicy {
-	networkPolicies, err := ds.d.l7Proxy.GetNetworkPolicies(resourceNames)
+	networkPolicies, err := ds.d.envoyXdsServer.GetNetworkPolicies(resourceNames)
 	c.Assert(err, IsNil)
 	return networkPolicies
 }
@@ -201,7 +201,8 @@ func prepareEndpointDirs() (cleanup func(), err error) {
 	}
 	return func() {
 		for _, testEPDir := range testDirs {
-			os.RemoveAll(fmt.Sprintf("%s/ep_config.h", testEPDir))
+			os.RemoveAll(filepath.Join(testEPDir, common.CHeaderFileName))
+			os.RemoveAll(filepath.Join(testEPDir, common.EndpointStateFileName))
 			time.Sleep(1 * time.Second)
 			os.RemoveAll(testEPDir)
 			os.RemoveAll(fmt.Sprintf("%s_backup", testEPDir))
@@ -214,7 +215,10 @@ func (ds *DaemonSuite) prepareEndpoint(c *C, identity *identity.Identity, qa boo
 	if qa {
 		testEndpointID = testQAEndpointID
 	}
-	e := endpoint.NewEndpointWithState(ds.d, ds.d, testipcache.NewMockIPCache(), ds.d.l7Proxy, ds.d.identityAllocator, testEndpointID, endpoint.StateWaitingForIdentity)
+	e := endpoint.NewTestEndpointWithState(c, ds.d, ds.d, testipcache.NewMockIPCache(), ds.d.l7Proxy, ds.d.identityAllocator, testEndpointID, endpoint.StateWaitingForIdentity)
+	e.SetPropertyValue(endpoint.PropertyFakeEndpoint, false)
+	e.SetPropertyValue(endpoint.PropertyWithouteBPFDatapath, true)
+	e.SetPropertyValue(endpoint.PropertySkipBPFPolicy, true)
 	if qa {
 		e.IPv6 = QAIPv6Addr
 		e.IPv4 = QAIPv4Addr
@@ -254,7 +258,6 @@ func (ds *DaemonSuite) TestUpdateConsumerMap(c *C) {
 					},
 				},
 				{
-
 					IngressCommonRule: api.IngressCommonRule{
 						FromEndpoints: []api.EndpointSelector{
 							api.NewESFromLabels(lblFoo),
@@ -272,7 +275,6 @@ func (ds *DaemonSuite) TestUpdateConsumerMap(c *C) {
 			Ingress: []api.IngressRule{
 				{
 					IngressCommonRule: api.IngressCommonRule{
-
 						FromRequires: []api.EndpointSelector{
 							api.NewESFromLabels(lblQA),
 						},
@@ -293,8 +295,11 @@ func (ds *DaemonSuite) TestUpdateConsumerMap(c *C) {
 			},
 		},
 	}
+	for i := range rules {
+		rules[i].Sanitize()
+	}
 
-	ds.d.l7Proxy.RemoveAllNetworkPolicies()
+	ds.d.envoyXdsServer.RemoveAllNetworkPolicies()
 
 	_, err3 := ds.d.PolicyAdd(rules, policyAddOptions)
 	c.Assert(err3, Equals, nil)
@@ -347,12 +352,12 @@ func (ds *DaemonSuite) TestUpdateConsumerMap(c *C) {
 
 	qaBarNetworkPolicy := networkPolicies[QAIPv4Addr.String()]
 	c.Assert(qaBarNetworkPolicy, Not(IsNil))
-	expectedRemotePolicies := []uint64{
-		uint64(qaFooSecLblsCtx.ID),
+	expectedRemotePolicies := []uint32{
+		uint32(qaFooSecLblsCtx.ID),
 		// The prodFoo* identities are allowed by FromEndpoints but rejected by
 		// FromRequires, so they are not included in the remote policies:
-		// uint64(prodFooSecLblsCtx.ID),
-		// uint64(prodFooJoeSecLblsCtx.ID),
+		// uint32(prodFooSecLblsCtx.ID),
+		// uint32(prodFooJoeSecLblsCtx.ID),
 	}
 	sort.Slice(expectedRemotePolicies, func(i, j int) bool {
 		return expectedRemotePolicies[i] < expectedRemotePolicies[j]
@@ -389,12 +394,12 @@ func (ds *DaemonSuite) TestUpdateConsumerMap(c *C) {
 
 	prodBarNetworkPolicy := networkPolicies[ProdIPv4Addr.String()]
 	c.Assert(prodBarNetworkPolicy, Not(IsNil))
-	expectedRemotePolicies = []uint64{
+	expectedRemotePolicies = []uint32{
 		// The qaFoo identity is allowed by FromEndpoints but rejected by
 		// FromRequires, so it is not included in the remote policies:
 		// uint64(qaFooSecLblsCtx.ID),
-		uint64(prodFooSecLblsCtx.ID),
-		uint64(prodFooJoeSecLblsCtx.ID),
+		uint32(prodFooSecLblsCtx.ID),
+		uint32(prodFooJoeSecLblsCtx.ID),
 	}
 	sort.Slice(expectedRemotePolicies, func(i, j int) bool {
 		return expectedRemotePolicies[i] < expectedRemotePolicies[j]
@@ -454,7 +459,6 @@ func (ds *DaemonSuite) TestL4_L7_Shadowing(c *C) {
 				},
 				{
 					IngressCommonRule: api.IngressCommonRule{
-
 						FromEndpoints: []api.EndpointSelector{
 							api.NewESFromLabels(lblFoo),
 						},
@@ -467,8 +471,11 @@ func (ds *DaemonSuite) TestL4_L7_Shadowing(c *C) {
 			},
 		},
 	}
+	for i := range rules {
+		rules[i].Sanitize()
+	}
 
-	ds.d.l7Proxy.RemoveAllNetworkPolicies()
+	ds.d.envoyXdsServer.RemoveAllNetworkPolicies()
 
 	_, err = ds.d.PolicyAdd(rules, policyAddOptions)
 	c.Assert(err, Equals, nil)
@@ -499,7 +506,7 @@ func (ds *DaemonSuite) TestL4_L7_Shadowing(c *C) {
 				Rules: []*cilium.PortNetworkPolicyRule{
 					{},
 					{
-						RemotePolicies: []uint64{uint64(qaFooSecLblsCtx.ID)},
+						RemotePolicies: []uint32{uint32(qaFooSecLblsCtx.ID)},
 						L7:             &PNPAllowGETbarLog,
 					},
 				},
@@ -538,7 +545,6 @@ func (ds *DaemonSuite) TestL4_L7_ShadowingShortCircuit(c *C) {
 				},
 				{
 					IngressCommonRule: api.IngressCommonRule{
-
 						FromEndpoints: []api.EndpointSelector{
 							api.NewESFromLabels(lblFoo),
 						},
@@ -551,8 +557,11 @@ func (ds *DaemonSuite) TestL4_L7_ShadowingShortCircuit(c *C) {
 			},
 		},
 	}
+	for i := range rules {
+		rules[i].Sanitize()
+	}
 
-	ds.d.l7Proxy.RemoveAllNetworkPolicies()
+	ds.d.envoyXdsServer.RemoveAllNetworkPolicies()
 
 	_, err = ds.d.PolicyAdd(rules, policyAddOptions)
 	c.Assert(err, Equals, nil)
@@ -638,8 +647,11 @@ func (ds *DaemonSuite) TestL3_dependent_L7(c *C) {
 			},
 		},
 	}
+	for i := range rules {
+		rules[i].Sanitize()
+	}
 
-	ds.d.l7Proxy.RemoveAllNetworkPolicies()
+	ds.d.envoyXdsServer.RemoveAllNetworkPolicies()
 
 	_, err = ds.d.PolicyAdd(rules, policyAddOptions)
 	c.Assert(err, Equals, nil)
@@ -670,7 +682,7 @@ func (ds *DaemonSuite) TestL3_dependent_L7(c *C) {
 				Protocol: envoy_config_core.SocketAddress_TCP,
 				Rules: []*cilium.PortNetworkPolicyRule{
 					{
-						RemotePolicies: []uint64{uint64(qaJoeSecLblsCtx.ID)},
+						RemotePolicies: []uint32{uint32(qaJoeSecLblsCtx.ID)},
 					},
 				},
 			},
@@ -713,6 +725,9 @@ func (ds *DaemonSuite) TestReplacePolicy(c *C) {
 			EndpointSelector: api.NewESFromLabels(lblBar),
 		},
 	}
+	for i := range rules {
+		rules[i].Sanitize()
+	}
 
 	_, err := ds.d.PolicyAdd(rules, policyAddOptions)
 	c.Assert(err, IsNil)
@@ -735,25 +750,6 @@ func (ds *DaemonSuite) TestReplacePolicy(c *C) {
 	ds.d.policy.Mutex.RLock()
 	c.Assert(len(ds.d.policy.SearchRLocked(lbls)), Equals, 2)
 	ds.d.policy.Mutex.RUnlock()
-
-	// Updating of prefix lengths may complete *after* PolicyAdd returns. Add a
-	// wait for prefix lengths to be correct after timeout to ensure that we
-	// do not assert before the releasing of CIDRs has been performed.
-	testutils.WaitUntil(func() bool {
-		_, s4 := ds.d.prefixLengths.ToBPFData()
-		sort.Ints(s4)
-		if len(s4) != 2 {
-			c.Logf("IPv4 Prefix lengths incorrect (expected [0, 32]). This may be because CIDRs were not released on replace. %+v", s4)
-			return false
-		}
-		for i, v := range []int{0, 32} {
-			if s4[i] != v {
-				c.Logf("Unexpected IPv4 Prefix length. This may be because CIDRs were not released on replace. %+v", s4)
-				return false
-			}
-		}
-		return true
-	}, time.Second*5)
 }
 
 func (ds *DaemonSuite) TestRemovePolicy(c *C) {
@@ -813,8 +809,11 @@ func (ds *DaemonSuite) TestRemovePolicy(c *C) {
 			},
 		},
 	}
+	for i := range rules {
+		rules[i].Sanitize()
+	}
 
-	ds.d.l7Proxy.RemoveAllNetworkPolicies()
+	ds.d.envoyXdsServer.RemoveAllNetworkPolicies()
 
 	_, err3 := ds.d.PolicyAdd(rules, policyAddOptions)
 	c.Assert(err3, Equals, nil)
@@ -898,8 +897,11 @@ func (ds *DaemonSuite) TestIncrementalPolicy(c *C) {
 			},
 		},
 	}
+	for i := range rules {
+		rules[i].Sanitize()
+	}
 
-	ds.d.l7Proxy.RemoveAllNetworkPolicies()
+	ds.d.envoyXdsServer.RemoveAllNetworkPolicies()
 
 	_, err3 := ds.d.PolicyAdd(rules, policyAddOptions)
 	c.Assert(err3, Equals, nil)
@@ -962,7 +964,7 @@ func (ds *DaemonSuite) TestIncrementalPolicy(c *C) {
 				Protocol: envoy_config_core.SocketAddress_TCP,
 				Rules: []*cilium.PortNetworkPolicyRule{
 					{
-						RemotePolicies: []uint64{uint64(qaFooID.ID)},
+						RemotePolicies: []uint32{uint32(qaFooID.ID)},
 					},
 				},
 			},
@@ -990,12 +992,6 @@ func (ds *DaemonSuite) TestIncrementalPolicy(c *C) {
 }
 
 func (ds *DaemonSuite) Test_addCiliumNetworkPolicyV2(c *C) {
-	back := option.Config.DisableCNPStatusUpdates
-	defer func() {
-		option.Config.DisableCNPStatusUpdates = back
-	}()
-	option.Config.DisableCNPStatusUpdates = true
-
 	uuid := k8sTypes.UID("13bba160-ddca-13e8-b697-0800273b04ff")
 	type args struct {
 		ciliumV2Store cache.Store
@@ -1305,9 +1301,6 @@ func (ds *DaemonSuite) Test_addCiliumNetworkPolicyV2(c *C) {
 
 		rules, policyImportErr := args.cnp.Parse()
 		c.Assert(policyImportErr, checker.DeepEquals, want.err)
-
-		policyImportErr = k8s.PreprocessRules(rules, ds.d.k8sWatcher.K8sSvcCache)
-		c.Assert(policyImportErr, IsNil)
 
 		// Only add policies if we have successfully parsed them. Otherwise, if
 		// parsing fails, `rules` is nil, which would wipe out the repo.

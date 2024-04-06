@@ -722,34 +722,6 @@ func (s *IPTestSuite) TestPartitionCIDR(c *C) {
 	s.testIPNetsEqual([]*net.IPNet{excludeCIDR}, exclude, c)
 }
 
-// TestKeepUniqueIPs tests that KeepUniqueIPs returns a slice with only the unique IPs
-func (s *IPTestSuite) TestKeepUniqueIPs(c *C) {
-	// test nil/empty handling
-	ips := KeepUniqueIPs(nil)
-	c.Assert(len(ips), Equals, 0, Commentf("Non-empty slice returned with empty input"))
-
-	// test all duplicate
-	ips = KeepUniqueIPs([]net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("1.1.1.1"), net.ParseIP("1.1.1.1")})
-	c.Assert(len(ips), Equals, 1, Commentf("Too many IPs returned for only 1 unique"))
-	c.Assert(ips[0].String(), Equals, "1.1.1.1", Commentf("Incorrect unique IP returned"))
-
-	// test all unique
-	ipSource := []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("2.2.2.2"), net.ParseIP("3.3.3.3")}
-	ips = KeepUniqueIPs(ipSource)
-	c.Assert(len(ips), Equals, 3, Commentf("Too few IPs returned for only 3 uniques"))
-	for i := range ipSource {
-		c.Assert(ips[i].String(), Equals, ipSource[i].String(), Commentf("Incorrect unique IP returned"))
-	}
-
-	// test mixed
-	ipSource = []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("2.2.2.2"), net.ParseIP("3.3.3.3"), net.ParseIP("2.2.2.2")}
-	ips = KeepUniqueIPs(ipSource)
-	c.Assert(len(ips), Equals, 3, Commentf("Too few IPs returned for only 3 uniques"))
-	for i := range ipSource[:3] {
-		c.Assert(ips[i].String(), Equals, ipSource[i].String(), Commentf("Incorrect unique IP returned"))
-	}
-}
-
 func TestKeepUniqueAddrs(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -911,9 +883,6 @@ func (s *IPTestSuite) TestIPListEquals(c *C) {
 	ips := []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("fd00::1"), net.ParseIP("8.8.8.8")}
 	sorted := []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("8.8.8.8"), net.ParseIP("fd00::1")}
 
-	sortedIPs := getSortedIPList(ips)
-	c.Assert(SortedIPListsAreEqual(sorted, sortedIPs), checker.Equals, true)
-
 	c.Assert(UnsortedIPListsAreEqual(ips, sorted), checker.Equals, true)
 }
 
@@ -1071,4 +1040,60 @@ func (s *IPTestSuite) TestMustAddrsFromIPs(c *C) {
 		}
 	}()
 	_ = MustAddrsFromIPs(nilIPs)
+}
+
+func (s *IPTestSuite) TestPrefixToIpsValidIPv4(c *C) {
+	prefix := "192.168.1.0/30"
+	expectedIPs := []string{"192.168.1.0", "192.168.1.1", "192.168.1.2", "192.168.1.3"}
+	ips, err := PrefixToIps(prefix, 0)
+	c.Assert(err, IsNil)
+	c.Assert(ips, checker.DeepEquals, expectedIPs)
+}
+
+func (s *IPTestSuite) TestPrefixToIpsValidLimitedIPv4(c *C) {
+	prefix := "192.168.1.0/28"
+	expectedIPs := []string{"192.168.1.0", "192.168.1.1", "192.168.1.2", "192.168.1.3"}
+	ips, err := PrefixToIps(prefix, 4)
+	c.Assert(err, IsNil)
+	c.Assert(ips, checker.DeepEquals, expectedIPs)
+}
+
+func (s *IPTestSuite) TestPrefixToIpsValidIPv6(c *C) {
+	prefix := "2001:DB8::/126"
+	expectedIPs := []string{"2001:db8::", "2001:db8::1", "2001:db8::2", "2001:db8::3"}
+	ips, err := PrefixToIps(prefix, 0)
+	c.Assert(err, IsNil)
+	c.Assert(ips, checker.DeepEquals, expectedIPs)
+}
+
+func (s *IPTestSuite) TestPrefixToIpsValidLimitedIPv6(c *C) {
+	prefix := "2001:DB8::/80"
+	expectedIPs := []string{"2001:db8::", "2001:db8::1", "2001:db8::2", "2001:db8::3"}
+	ips, err := PrefixToIps(prefix, 4)
+	c.Assert(err, IsNil)
+	c.Assert(ips, checker.DeepEquals, expectedIPs)
+}
+
+func (s *IPTestSuite) TestPrefixToIPsInvalidPrefix(c *C) {
+	prefix := "invalid"
+	ips, err := PrefixToIps(prefix, 0)
+	c.Assert(err, NotNil)
+	c.Assert(ips, HasLen, 0)
+}
+
+func (s *IPTestSuite) TestPrefixToIPv4sEdgeCase(c *C) {
+	prefix := "192.168.1.255/32"
+	expectedIPs := []string{"192.168.1.255"}
+	ips, err := PrefixToIps(prefix, 0)
+	c.Assert(err, IsNil)
+	c.Assert(ips, checker.DeepEquals, expectedIPs)
+}
+
+func (s *IPTestSuite) TestPrefixToIpsWithMaxIPv4sExceedingRange(c *C) {
+	prefix := "192.168.1.0/30"
+	maxIPs := 10 // Intentionally exceeding the available IPs in the prefix
+	expectedIPs := []string{"192.168.1.0", "192.168.1.1", "192.168.1.2", "192.168.1.3"}
+	ips, err := PrefixToIps(prefix, maxIPs)
+	c.Assert(err, IsNil)
+	c.Assert(ips, checker.DeepEquals, expectedIPs)
 }

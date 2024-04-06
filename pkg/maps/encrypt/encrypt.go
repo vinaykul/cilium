@@ -6,22 +6,18 @@ package encrypt
 import (
 	"fmt"
 	"sync"
-	"unsafe"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/ebpf"
 	"github.com/cilium/cilium/pkg/option"
 )
 
 // EncryptKey is the context ID for the encryption session
-// +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapKey
 type EncryptKey struct {
 	key uint32 `align:"ctx"`
 }
 
 // EncryptValue is ID assigned to the keys
-// +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapValue
 type EncryptValue struct {
 	encryptKeyID uint8
 }
@@ -31,20 +27,14 @@ func (k EncryptKey) String() string {
 	return fmt.Sprintf("%d", k.key)
 }
 
+func (k EncryptKey) New() bpf.MapKey { return &EncryptKey{} }
+
 // String pretty print the encryption key index.
 func (v EncryptValue) String() string {
 	return fmt.Sprintf("%d", v.encryptKeyID)
 }
 
-// GetValuePtr returns the unsafe pointer to the BPF value.
-func (v *EncryptValue) GetValuePtr() unsafe.Pointer { return unsafe.Pointer(v) }
-
-// GetKeyPtr returns the unsafe pointer to the BPF key
-func (k *EncryptKey) GetKeyPtr() unsafe.Pointer { return unsafe.Pointer(k) }
-
-// NewValue returns a new empty instance of the structure represeting the BPF
-// map value
-func (k EncryptKey) NewValue() bpf.MapValue { return &EncryptValue{} }
+func (v EncryptValue) New() bpf.MapValue { return &EncryptValue{} }
 
 func newEncryptKey(key uint32) *EncryptKey {
 	return &EncryptKey{
@@ -65,19 +55,21 @@ var (
 	encryptMap *bpf.Map
 )
 
-// MapCreate will create an encrypt map
+// NewMap will construct a bpf.Map that is not open or created yet.
+func NewMap(MapName string) *bpf.Map {
+	return bpf.NewMap(MapName,
+		ebpf.Array,
+		&EncryptKey{},
+		&EncryptValue{},
+		MaxEntries,
+		0,
+	)
+}
+
+// MapCreate will create an encrypt map that is ready for use.
 func MapCreate() error {
 	once.Do(func() {
-		encryptMap = bpf.NewMap(MapName,
-			bpf.MapTypeArray,
-			&EncryptKey{},
-			int(unsafe.Sizeof(EncryptKey{})),
-			&EncryptValue{},
-			int(unsafe.Sizeof(EncryptValue{})),
-			MaxEntries,
-			0,
-			bpf.ConvertKeyValue,
-		).WithCache().
+		encryptMap = NewMap(MapName).WithCache().
 			WithEvents(option.Config.GetEventBufferConfig(MapName))
 	})
 
@@ -91,4 +83,16 @@ func MapUpdateContext(ctxID uint32, keyID uint8) error {
 		encryptKeyID: keyID,
 	}
 	return encryptMap.Update(k, v)
+}
+
+// MapUpdateContextWithMap updates the encrypt state with ctxID to use the new keyID
+// with the map as its argument.
+//
+// This is primarily used in tests.
+func MapUpdateContextWithMap(m *bpf.Map, ctxID uint32, keyID uint8) error {
+	k := newEncryptKey(ctxID)
+	v := &EncryptValue{
+		encryptKeyID: keyID,
+	}
+	return m.Update(k, v)
 }

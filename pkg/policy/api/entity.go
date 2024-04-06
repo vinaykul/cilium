@@ -23,6 +23,16 @@ const (
 	// endpoint's cluster
 	EntityWorld Entity = "world"
 
+	// EntityWorldIPv4 is an entity that represents traffic external to
+	// endpoint's cluster, specifically an IPv4 endpoint, to distinguish
+	// it from IPv6 in dual-stack mode.
+	EntityWorldIPv4 Entity = "world-ipv4"
+
+	// EntityWorldIPv6 is an entity that represents traffic external to
+	// endpoint's cluster, specifically an IPv6 endpoint, to distinguish
+	// it from IPv4 in dual-stack mode.
+	EntityWorldIPv6 Entity = "world-ipv6"
+
 	// EntityCluster is an entity that represents traffic within the
 	// endpoint's cluster, to endpoints not managed by cilium
 	EntityCluster Entity = "cluster"
@@ -55,6 +65,10 @@ const (
 var (
 	endpointSelectorWorld = NewESFromLabels(labels.NewLabel(labels.IDNameWorld, "", labels.LabelSourceReserved))
 
+	endpointSelectorWorldIPv4 = NewESFromLabels(labels.NewLabel(labels.IDNameWorldIPv4, "", labels.LabelSourceReserved))
+
+	endpointSelectorWorldIPv6 = NewESFromLabels(labels.NewLabel(labels.IDNameWorldIPv6, "", labels.LabelSourceReserved))
+
 	endpointSelectorHost = NewESFromLabels(labels.NewLabel(labels.IDNameHost, "", labels.LabelSourceReserved))
 
 	endpointSelectorInit = NewESFromLabels(labels.NewLabel(labels.IDNameInit, "", labels.LabelSourceReserved))
@@ -75,7 +89,9 @@ var (
 	// policies to selectors
 	EntitySelectorMapping = map[Entity]EndpointSelectorSlice{
 		EntityAll:           {WildcardEndpointSelector},
-		EntityWorld:         {endpointSelectorWorld},
+		EntityWorld:         {endpointSelectorWorld, endpointSelectorWorldIPv4, endpointSelectorWorldIPv6},
+		EntityWorldIPv4:     {endpointSelectorWorldIPv4},
+		EntityWorldIPv6:     {endpointSelectorWorldIPv6},
 		EntityHost:          {endpointSelectorHost},
 		EntityInit:          {endpointSelectorInit},
 		EntityIngress:       {endpointSelectorIngress},
@@ -114,7 +130,7 @@ func (s EntitySlice) GetAsEndpointSelectors() EndpointSelectorSlice {
 }
 
 // InitEntities is called to initialize the policy API layer
-func InitEntities(clusterName string, treatRemoteNodeAsHost bool) {
+func InitEntities(clusterName string) {
 	EntitySelectorMapping[EntityCluster] = EndpointSelectorSlice{
 		endpointSelectorHost,
 		endpointSelectorRemoteNode,
@@ -125,11 +141,4 @@ func InitEntities(clusterName string, treatRemoteNodeAsHost bool) {
 		endpointSelectorKubeAPIServer,
 		NewESFromLabels(labels.NewLabel(k8sapi.PolicyLabelCluster, clusterName, labels.LabelSourceK8s)),
 	}
-
-	hostSelectors := make(EndpointSelectorSlice, 0, 2)
-	hostSelectors = append(hostSelectors, endpointSelectorHost)
-	if treatRemoteNodeAsHost {
-		hostSelectors = append(hostSelectors, endpointSelectorRemoteNode)
-	}
-	EntitySelectorMapping[EntityHost] = hostSelectors
 }

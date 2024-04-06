@@ -7,23 +7,31 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"time"
 
 	healthApi "github.com/cilium/cilium/api/v1/health/server"
 	health "github.com/cilium/cilium/cilium-health/launch"
 	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/health/defaults"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/pidfile"
+	"github.com/cilium/cilium/pkg/time"
 )
 
-func (d *Daemon) initHealth(spec *healthApi.Spec, cleaner *daemonCleanup) {
+var healthControllerGroup = controller.NewGroup("cilium-health")
+
+const (
+	controllerInterval    = 60 * time.Second
+	successfulPingTimeout = 3 * time.Minute
+)
+
+func (d *Daemon) initHealth(spec *healthApi.Spec, cleaner *daemonCleanup, sysctl sysctl.Sysctl) {
 	// Launch cilium-health in the same process (and namespace) as cilium.
 	log.Info("Launching Cilium health daemon")
-	if ch, err := health.Launch(spec); err != nil {
+	if ch, err := health.Launch(spec, d.datapath.Loader().HostDatapathInitialized()); err != nil {
 		log.WithError(err).Fatal("Failed to launch cilium-health")
 	} else {
 		d.ciliumHealth = ch
@@ -50,18 +58,29 @@ func (d *Daemon) initHealth(spec *healthApi.Spec, cleaner *daemonCleanup) {
 
 	// Wait for the API, then launch the controller
 	var client *health.Client
+	var lastSuccessfulPing time.Time
 
-	controller.NewManager().UpdateController(defaults.HealthEPName,
+	controller.NewManager().UpdateController(
+		defaults.HealthEPName,
 		controller.ControllerParams{
+			Group: healthControllerGroup,
 			DoFunc: func(ctx context.Context) error {
 				var err error
 
 				if client != nil {
 					err = client.PingEndpoint()
 				}
-				// On the first initialization, or on
-				// error, restart the health EP.
-				if client == nil || err != nil {
+
+				// Reset lastSuccessfulPing if err is nil, which happens
+				// a) if we successfully pinged the endpoint above
+				// b) on first initialization, i.e. we have not attempted to ping yet
+				if err == nil {
+					lastSuccessfulPing = time.Now()
+				}
+
+				// On the first initialization (client == nil), or if we have not
+				// successfully pinged it since successfulPingTimeout, restart the health EP.
+				if client == nil || time.Since(lastSuccessfulPing) > successfulPingTimeout {
 					var launchErr error
 					d.cleanupHealthEndpoint()
 
@@ -76,10 +95,11 @@ func (d *Daemon) initHealth(spec *healthApi.Spec, cleaner *daemonCleanup) {
 						d.l7Proxy,
 						d.identityAllocator,
 						d.healthEndpointRouting,
+						sysctl,
 					)
 					if launchErr != nil {
 						if err != nil {
-							return fmt.Errorf("failed to restart endpoint (check failed: %q): %s", err, launchErr)
+							return fmt.Errorf("failed to restart endpoint (check failed: %w): %w", err, launchErr)
 						}
 						return launchErr
 					}
@@ -92,7 +112,7 @@ func (d *Daemon) initHealth(spec *healthApi.Spec, cleaner *daemonCleanup) {
 				d.cleanupHealthEndpoint()
 				return err
 			},
-			RunInterval: 60 * time.Second,
+			RunInterval: controllerInterval,
 			Context:     d.ctx,
 		},
 	)

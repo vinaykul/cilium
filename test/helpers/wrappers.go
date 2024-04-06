@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // PerfTest represents a type of test to run when running `netperf`.
@@ -79,7 +80,7 @@ func CurlFail(endpoint string, optionalValues ...interface{}) string {
 		endpoint = fmt.Sprintf(endpoint, optionalValues...)
 	}
 	return fmt.Sprintf(
-		`curl --path-as-is -s -D /dev/stderr --fail --connect-timeout %d --max-time %d %s -w "%s"`,
+		`curl -k --path-as-is -s -D /dev/stderr --fail --connect-timeout %d --max-time %d %s -w "%s"`,
 		CurlConnectTimeout, CurlMaxTimeout, endpoint, statsInfo)
 }
 
@@ -90,7 +91,7 @@ func CurlFailNoStats(endpoint string, optionalValues ...interface{}) string {
 		endpoint = fmt.Sprintf(endpoint, optionalValues...)
 	}
 	return fmt.Sprintf(
-		`curl --path-as-is -s -D /dev/stderr --fail --connect-timeout %[1]d --max-time %[2]d %[3]s`,
+		`curl -k --path-as-is -s -D /dev/stderr --fail --connect-timeout %[1]d --max-time %[2]d %[3]s`,
 		CurlConnectTimeout, CurlMaxTimeout, endpoint)
 }
 
@@ -105,7 +106,7 @@ func CurlWithHTTPCode(endpoint string, optionalValues ...interface{}) string {
 	}
 
 	return fmt.Sprintf(
-		`curl --path-as-is -s  -D /dev/stderr --output /dev/stderr -w '%%{http_code}' --connect-timeout %d %s`,
+		`curl -k --path-as-is -s  -D /dev/stderr --output /dev/stderr -w '%%{http_code}' --connect-timeout %d %s`,
 		CurlConnectTimeout, endpoint)
 }
 
@@ -125,8 +126,22 @@ func CurlWithRetries(endpoint string, retries int, fail bool, optionalValues ...
 		endpoint = fmt.Sprintf(endpoint, optionalValues...)
 	}
 	return fmt.Sprintf(
-		`curl --path-as-is -s  -D /dev/stderr --output /dev/stderr --retry %d %s`,
+		`curl -k --path-as-is -s  -D /dev/stderr --output /dev/stderr --retry %d %s`,
 		retries, endpoint)
+}
+
+// CurlTimeout does the same as CurlFail() except you can define the timeout.
+// See note about optionalValues on CurlFail().
+func CurlTimeout(endpoint string, timeout time.Duration, optionalValues ...interface{}) string {
+	statsInfo := `time-> DNS: '%{time_namelookup}(%{remote_ip})', Connect: '%{time_connect}',` +
+		`Transfer '%{time_starttransfer}', total '%{time_total}'`
+
+	if len(optionalValues) > 0 {
+		endpoint = fmt.Sprintf(endpoint, optionalValues...)
+	}
+	return fmt.Sprintf(
+		`curl -k --path-as-is -s -D /dev/stderr --fail --connect-timeout %d --max-time %d %s -w "%s"`,
+		timeout, timeout, endpoint, statsInfo)
 }
 
 // Netperf returns the string representing the netperf command to use when testing
@@ -195,7 +210,7 @@ func OpenSSLShowCerts(host string, port uint16, serverName string) string {
 // GetBPFPacketsCount returns the number of packets for a given drop reason and
 // direction by parsing BPF metrics.
 func GetBPFPacketsCount(kubectl *Kubectl, pod, reason, direction string) (int, error) {
-	cmd := fmt.Sprintf("cilium bpf metrics list -o json | jq '.[] | select(.description == \"%s\").values.%s.packets'", reason, direction)
+	cmd := fmt.Sprintf("cilium-dbg bpf metrics list -o json | jq '[.[] | select(.reason == \"%s\") | select(.direction == \"%s\").packets] | add'", reason, direction)
 
 	res := kubectl.CiliumExecMustSucceed(context.TODO(), pod, cmd)
 

@@ -6,6 +6,7 @@ package helpers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -20,6 +21,14 @@ import (
 
 	"github.com/cilium/cilium/test/logger"
 )
+
+type JSONParseError struct {
+	error
+}
+
+func (e *JSONParseError) Error() string {
+	return e.error.Error()
+}
 
 // CmdStreamBuffer is a buffer that buffers the stream output of a command.
 type CmdStreamBuffer struct {
@@ -75,7 +84,9 @@ func (b *CmdStreamBuffer) Filter(filter string) (*FilterBuffer, error) {
 
 	err := json.Unmarshal(b.Bytes(), &data)
 	if err != nil {
-		return nil, fmt.Errorf("could not parse JSON from command %q\n%w\n%s", b.Cmd(), err, b.Bytes())
+		return nil, &JSONParseError{
+			error: fmt.Errorf("could not parse JSON from command %q\n%w\n%s", b.Cmd(), err, b.Bytes()),
+		}
 	}
 	parser := jsonpath.New("").AllowMissingKeys(true)
 	parser.Parse(filter)
@@ -100,7 +111,9 @@ func (b *CmdStreamBuffer) FilterLinesJSONPath(filter *jsonpath.JSONPath) ([]Filt
 		result := new(bytes.Buffer)
 		err := json.Unmarshal([]byte(line), &data)
 		if err != nil {
-			return nil, fmt.Errorf("could not parse %q as JSON (line %d of %q)", line, i, b.Cmd())
+			return nil, &JSONParseError{
+				error: fmt.Errorf("could not parse %q as JSON (line %d of %q)", line, i, b.Cmd()),
+			}
 		}
 
 		err = filter.Execute(result, data)
@@ -131,7 +144,7 @@ type CmdRes struct {
 	stderr   *Buffer         // Stderr from running cmd
 	success  bool            // Whether command successfully executed
 	exitcode int             // The exit code of cmd
-	duration time.Duration   // Is the representation of the the time that command took to execute.
+	duration time.Duration   // Is the representation of the time that command took to execute.
 	wg       *sync.WaitGroup // Used to wait until the command has finished running when used in conjunction with a Context
 	err      error           // If the command had any error being executed, the error will be written here.
 }
@@ -485,6 +498,10 @@ func (res *CmdRes) WaitUntilMatchFilterLineTimeout(filter, expected string, time
 	body := func() bool {
 		lines, err := res.FilterLinesJSONPath(parsedFilter)
 		if err != nil {
+			if errors.Is(err, &JSONParseError{}) {
+				// We might have read a partial line; continue
+				return false
+			}
 			errChan <- err
 			return true
 		}
@@ -500,7 +517,7 @@ func (res *CmdRes) WaitUntilMatchFilterLineTimeout(filter, expected string, time
 	err = RepeatUntilTrue(body, &TimeoutConfig{Timeout: timeout})
 	if err != nil {
 		return fmt.Errorf(
-			"Expected string %q is not in the filter output of %q: %s",
+			"Expected string %q is not in the filter output of %q: %w",
 			expected, filter, err)
 	}
 
